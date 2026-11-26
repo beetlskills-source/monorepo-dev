@@ -1,0 +1,36 @@
+{
+  "name": "tsundoku",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "node": ">=22.23.4"
+  },
+  "scripts": {
+    "dev": "astro dev --host",
+    "build": "astro build",
+    "preview": "astro preview",
+    "local": "astro build && wrangler dev",
+    "deploy": "astro build && wrangler deploy",
+    "check": "astro check",
+    "test": "vitest run",
+    "astro": "astro",
+    "wrangler": "wrangler"
+  },
+  "dependencies": {
+    "@astrojs/cloudflare": "^14.4.9",
+    "@repo/book-schemas": "workspace:*",
+    "@repo/isbn": "workspace:*",
+    "@zxing/browser": "^0.1.5",
+    "astro": "^7.4.13",
+    "better-auth": "^1.7.27",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.4",
+    "@cloudflare/workers-types": "^5.20261124.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.166.0"
+  }
+}

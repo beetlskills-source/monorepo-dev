@@ -1,0 +1,911 @@
+---
+export const prerender = false;
+
+import { env } from "cloudflare:workers";
+import { getShelfConfig, type ShelfConfig } from "../lib/shelf-configs";
+import { getPickerPublicConfig, resolveSpreadsheetTitle } from "../lib/sheet-service";
+
+const { user } = Astro.locals;
+if (!user) {
+  return Astro.redirect("/login?next=%2Fsettings");
+}
+
+// Failure-isolated: a schema drift (e.g. an unapplied migration) or a transient
+// D1 error must never take down the page. Fall back to the "no sheet" defaults
+// so the settings UI still renders and the user can reconnect.
+let config: ShelfConfig | null = null;
+try {
+  config = await getShelfConfig(env.DB, user.id);
+} catch {
+  config = null;
+}
+const connected = config?.hasRefreshToken ?? false;
+const spreadsheetId = config?.spreadsheetId ?? null;
+const spreadsheetUrl = spreadsheetId
+  ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}`
+  : null;
+// Resolve the live file name from Google so renames made in Drive show up;
+// fall back to the raw id when the metadata read fails. `spreadsheet_id` stays
+// the source of truth for every read/write.
+const spreadsheetTitle =
+  spreadsheetId && connected
+    ? await resolveSpreadsheetTitle(env, user.id, spreadsheetId)
+    : null;
+const spreadsheetLabel = spreadsheetId
+  ? `${spreadsheetTitle ?? spreadsheetId}${
+      config?.sheetTabName ? ` (tab: ${config.sheetTabName})` : ""
+    }`
+  : null;
+const defaultVisibility = config?.defaultVisibility ?? "private";
+const allowIncomingTransfers = config?.allowIncomingTransfers ?? false;
+
+// Only the public Picker API key / project number are exposed to the browser.
+const picker = getPickerPublicConfig(env);
+
+const statusParam = Astro.url.searchParams.get("sheets");
+const statusMessages: Record<string, { tone: string; text: string }> = {
+  connected: {
+    tone: "success",
+    text: "Google account connected. Create or pick a sheet below.",
+  },
+  denied: { tone: "warning", text: "Google authorization was cancelled." },
+  state_mismatch: {
+    tone: "error",
+    text: "The authorization attempt expired or was tampered with. Please try again.",
+  },
+  exchange_failed: {
+    tone: "error",
+    text: "Google rejected the authorization code. Please try again.",
+  },
+  no_refresh_token: {
+    tone: "error",
+    text: "Google did not return a refresh token. Revoke access in your Google account, then reconnect.",
+  },
+  store_failed: {
+    tone: "error",
+    text: "We could not store the connection. Check the server's SHEET_TOKEN_ENCRYPTION_KEY.",
+  },
+  config_error: {
+    tone: "error",
+    text: "Google Sheets is not fully configured on this deployment.",
+  },
+};
+const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+    <title>Settings — Tsundoku</title>
+  </head>
+  <body>
+    <main
+      class="app"
+      data-picker-key={picker.apiKey ?? ""}
+      data-picker-app-id={picker.appId ?? ""}
+    >
+      <header class="header">
+        <div>
+          <h1>Shelf settings</h1>
+          <p class="subtitle">Signed in as {user.email}</p>
+        </div>
+        <a class="button" href="/dashboard">Dashboard</a>
+      </header>
+
+      {
+        status && (
+          <p class="status" data-tone={status.tone} role="status">
+            {status.text}
+          </p>
+        )
+      }
+
+      <p id="sheet-status" class="status" data-tone="info" role="status" hidden />
+
+      <section class="panel" aria-label="Google account">
+        <h2>Google account</h2>
+        <p class="muted" id="connection-summary">
+          {
+            connected
+              ? "A Google account is connected with per-file (drive.file) access."
+              : "Connect a Google account to let Tsundoku create and update its own spreadsheet."
+          }
+        </p>
+        <div class="controls">
+          <a class="button" href="/api/sheets/connect">
+            {connected ? "Reconnect Google account" : "Connect Google account"}
+          </a>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="Personal sheet">
+        <h2>Personal Google Sheet</h2>
+        <p class="muted" id="sheet-summary">
+          {
+            spreadsheetLabel && spreadsheetUrl ? (
+              <span>
+                Linked sheet:{" "}
+                <a href={spreadsheetUrl} target="_blank" rel="noreferrer">
+                  {spreadsheetLabel}
+                </a>
+              </span>
+            ) : (
+              "No sheet linked yet. Create a new one in a click, or pick an existing sheet from Google Drive."
+            )
+          }
+        </p>
+
+        <div class="controls">
+          <button type="button" id="create-sheet" disabled={!connected}>
+            Create New Google Sheet
+          </button>
+          <button
+            type="button"
+            id="browse-drive"
+            disabled={!connected || !picker.apiKey}
+          >
+            Browse Google Drive
+          </button>
+          <button type="button" id="detach-sheet" disabled={!spreadsheetId}>
+            Unlink sheet
+          </button>
+        </div>
+
+        {
+          !picker.apiKey && (
+            <p class="muted">
+              “Browse Google Drive” needs a public GOOGLE_PICKER_API_KEY on this
+              deployment. Creating a new sheet works without it.
+            </p>
+          )
+        }
+
+        <div id="picker-panel" class="picker-panel" hidden>
+          <p class="muted">
+            Selected: <strong id="picked-name">—</strong>
+          </p>
+          <label for="tab-select">Tab to use</label>
+          <div class="controls">
+            <select id="tab-select"></select>
+            <button type="button" id="link-sheet">Link this sheet</button>
+            <button type="button" id="picker-cancel">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="Privacy">
+        <h2>Sharing defaults</h2>
+        <form id="prefs-form">
+          <fieldset>
+            <legend>Default visibility for new books</legend>
+            <label>
+              <input
+                type="radio"
+                name="visibility"
+                value="private"
+                checked={defaultVisibility === "private"}
+              />
+              Private
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="visibility"
+                value="shared"
+                checked={defaultVisibility === "shared"}
+              />
+              Shared
+            </label>
+          </fieldset>
+
+          <p class="muted">
+            Applies only to newly scanned books. Whether your whole sheet is
+            visible to co-members is a separate setting, controlled by the
+            sheet-visibility control above the book table on the dashboard.
+          </p>
+
+          <label class="toggle">
+            <input
+              type="checkbox"
+              id="allow-transfers"
+              checked={allowIncomingTransfers}
+            />
+            Allow incoming ownership transfers
+          </label>
+
+          <button type="submit" id="save-prefs">Save preferences</button>
+        </form>
+      </section>
+
+      <p class="back"><a href="/">← Back to the scanner</a></p>
+    </main>
+
+    <script>
+      /** Minimal typings for the Google Picker API (loaded on demand). */
+      interface PickerDoc {
+        id?: string;
+        name?: string;
+      }
+      interface PickerResponse {
+        action?: string;
+        docs?: PickerDoc[];
+      }
+      interface PickerBuilder {
+        addView(view: unknown): PickerBuilder;
+        setOAuthToken(token: string): PickerBuilder;
+        setDeveloperKey(key: string): PickerBuilder;
+        setAppId(appId: string): PickerBuilder;
+        setCallback(callback: (data: PickerResponse) => void): PickerBuilder;
+        build(): { setVisible(visible: boolean): void };
+      }
+      interface GooglePickerNamespace {
+        picker: {
+          PickerBuilder: new () => PickerBuilder;
+          ViewId: { SPREADSHEETS: unknown };
+          Action: { PICKED: string; CANCEL: string };
+        };
+      }
+      interface GapiNamespace {
+        load(
+          libraries: string,
+          options: {
+            callback: () => void;
+            onerror?: () => void;
+            // `gapi.load` throws unless `timeout` and `ontimeout` are supplied together.
+            timeout?: number;
+            ontimeout?: () => void;
+          },
+        ): void;
+      }
+      interface LinkedSheet {
+        spreadsheetId: string;
+        /** Live file name; `null` falls back to the id for display. */
+        title: string | null;
+        sheetTabName: string;
+        spreadsheetUrl: string | null;
+      }
+
+      const PICKER_SCRIPT_SRC = "https://apis.google.com/js/api.js";
+      const PICKER_SCRIPT_TIMEOUT_MS = 10000;
+      const PICKER_LOAD_TIMEOUT_MS = 10000;
+
+      /**
+       * Carries a machine-readable `code` (e.g. missing key/token, script
+       * timeout, gapi load failure) alongside the human-readable reason, so the
+       * Picker flow never collapses distinct failures into one generic message.
+       */
+      class PickerError extends Error {
+        readonly code: string;
+        readonly reason: string;
+
+        constructor(code: string, reason: string) {
+          super(reason);
+          this.name = "PickerError";
+          this.code = code;
+          this.reason = reason;
+        }
+      }
+
+      /** Best-effort human-readable description for any thrown value. */
+      function describeError(error: unknown): string {
+        if (error instanceof PickerError) {
+          return `${error.reason} (code: ${error.code})`;
+        }
+        if (error instanceof Error) {
+          return `${error.message} (${error.name})`;
+        }
+        return String(error);
+      }
+
+      const statusEl = document.getElementById("sheet-status") as HTMLParagraphElement;
+      const summaryEl = document.getElementById("sheet-summary") as HTMLParagraphElement;
+      const createButton = document.getElementById("create-sheet") as HTMLButtonElement;
+      const browseButton = document.getElementById("browse-drive") as HTMLButtonElement;
+      const detachButton = document.getElementById("detach-sheet") as HTMLButtonElement;
+      const pickerPanel = document.getElementById("picker-panel") as HTMLDivElement;
+      const pickedNameEl = document.getElementById("picked-name") as HTMLElement;
+      const tabSelect = document.getElementById("tab-select") as unknown as HTMLSelectElement;
+      const linkButton = document.getElementById("link-sheet") as HTMLButtonElement;
+      const pickerCancel = document.getElementById("picker-cancel") as HTMLButtonElement;
+      const prefsForm = document.getElementById("prefs-form") as HTMLFormElement;
+      const saveButton = document.getElementById("save-prefs") as HTMLButtonElement;
+      const allowTransfers = document.getElementById("allow-transfers") as HTMLInputElement;
+      const pageEl = document.querySelector("main.app") as HTMLElement | null;
+
+      const pickerApiKey = pageEl?.dataset.pickerKey ?? "";
+      const pickerAppId = pageEl?.dataset.pickerAppId ?? "";
+
+      let pendingSpreadsheetId: string | null = null;
+
+      function setStatus(message: string, tone: string): void {
+        statusEl.hidden = false;
+        statusEl.textContent = message;
+        statusEl.dataset.tone = tone;
+      }
+
+      async function readJson(response: Response): Promise<Record<string, unknown> | null> {
+        try {
+          const data: unknown = await response.json();
+          return typeof data === "object" && data !== null
+            ? (data as Record<string, unknown>)
+            : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function errorMessage(data: Record<string, unknown> | null, fallback: string): string {
+        return data && typeof data.message === "string" ? data.message : fallback;
+      }
+
+      /** Read the `{ config, spreadsheetUrl }` shape returned by the shelf route. */
+      function readLinkedSheet(data: Record<string, unknown> | null): LinkedSheet | null {
+        if (!data) return null;
+        const config = data.config;
+        if (typeof config !== "object" || config === null) return null;
+        const record = config as Record<string, unknown>;
+        const spreadsheetId =
+          typeof record.spreadsheetId === "string" ? record.spreadsheetId : "";
+        if (!spreadsheetId) return null;
+        return {
+          spreadsheetId,
+          title:
+            typeof data.spreadsheetTitle === "string" ? data.spreadsheetTitle : null,
+          sheetTabName:
+            typeof record.sheetTabName === "string" ? record.sheetTabName : "",
+          spreadsheetUrl:
+            typeof data.spreadsheetUrl === "string" ? data.spreadsheetUrl : null,
+        };
+      }
+
+      /** Render the "linked sheet" line with a link out to Google Sheets. */
+      function renderLinked(sheet: LinkedSheet): void {
+        const url =
+          sheet.spreadsheetUrl ??
+          `https://docs.google.com/spreadsheets/d/${sheet.spreadsheetId}`;
+        // Prefer the live file name; fall back to the id only when unknown.
+        const name = sheet.title ?? sheet.spreadsheetId;
+        const label = sheet.sheetTabName
+          ? `${name} (tab: ${sheet.sheetTabName})`
+          : name;
+
+        summaryEl.replaceChildren();
+        summaryEl.appendChild(document.createTextNode("Linked sheet: "));
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        link.textContent = label;
+        summaryEl.appendChild(link);
+
+        detachButton.disabled = false;
+      }
+
+      async function postSheetAction(
+        body: unknown,
+      ): Promise<Record<string, unknown> | null> {
+        try {
+          const response = await fetch("/api/sheets/shelf", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await readJson(response);
+          if (!response.ok) {
+            setStatus(errorMessage(data, "The request failed."), "error");
+            return null;
+          }
+          return data;
+        } catch {
+          setStatus("Network error while contacting the server.", "error");
+          return null;
+        }
+      }
+
+      /** Mint a short-lived access token for the Picker / client-side Sheets. */
+      async function fetchAccessToken(): Promise<string> {
+        let response: Response;
+        try {
+          response = await fetch("/api/sheets/token");
+        } catch (error) {
+          throw new PickerError(
+            "PICKER_TOKEN_NETWORK",
+            `Network error contacting /api/sheets/token: ${describeError(error)}`,
+          );
+        }
+        const data = await readJson(response);
+        if (!response.ok) {
+          throw new PickerError(
+            `PICKER_TOKEN_${response.status}`,
+            errorMessage(data, "The server could not mint a Google access token."),
+          );
+        }
+        const token =
+          data && typeof data.accessToken === "string" ? data.accessToken : "";
+        if (!token) {
+          throw new PickerError(
+            "PICKER_TOKEN_EMPTY",
+            "The server returned no access token.",
+          );
+        }
+        return token;
+      }
+
+      /** Load `api.js` once; resolves immediately if it is already present. */
+      function loadPickerScript(): Promise<void> {
+        return new Promise((resolve, reject) => {
+          let timer = 0;
+          const finish = (error: PickerError | null) => {
+            window.clearTimeout(timer);
+            if (error) reject(error);
+            else resolve();
+          };
+
+          const fail = () =>
+            finish(
+              new PickerError(
+                "PICKER_SCRIPT_ERROR",
+                `Failed to load ${PICKER_SCRIPT_SRC}. Check your network connection or the site's Content-Security-Policy.`,
+              ),
+            );
+
+          const existing = document.querySelector<HTMLScriptElement>(
+            `script[src="${PICKER_SCRIPT_SRC}"]`,
+          );
+          // `window.gapi` being present is the real readiness signal; the
+          // `dataset.loaded` flag is only a hint, so honor whichever is set.
+          const gapiReady =
+            typeof (window as unknown as { gapi?: unknown }).gapi !== "undefined";
+          if (existing && (existing.dataset.loaded === "true" || gapiReady)) {
+            finish(null);
+            return;
+          }
+
+          // Fail loudly instead of leaving the button stuck if the CDN hangs.
+          timer = window.setTimeout(() => {
+            finish(
+              new PickerError(
+                "PICKER_SCRIPT_TIMEOUT",
+                `Timed out after ${PICKER_SCRIPT_TIMEOUT_MS}ms loading ${PICKER_SCRIPT_SRC}.`,
+              ),
+            );
+          }, PICKER_SCRIPT_TIMEOUT_MS);
+
+          if (existing) {
+            existing.addEventListener("load", () => finish(null), { once: true });
+            existing.addEventListener("error", fail, { once: true });
+            return;
+          }
+
+          const script = document.createElement("script");
+          script.src = PICKER_SCRIPT_SRC;
+          script.async = true;
+          script.addEventListener(
+            "load",
+            () => {
+              script.dataset.loaded = "true";
+              finish(null);
+            },
+            { once: true },
+          );
+          script.addEventListener("error", fail, { once: true });
+          document.head.appendChild(script);
+        });
+      }
+
+      function showPickerPanel(spreadsheetId: string, name: string, tabs: string[]): void {
+        pendingSpreadsheetId = spreadsheetId;
+        pickedNameEl.textContent = name;
+
+        tabSelect.replaceChildren();
+        for (const tab of tabs.length > 0 ? tabs : ["Books"]) {
+          const option = document.createElement("option");
+          option.value = tab;
+          option.textContent = tab;
+          tabSelect.appendChild(option);
+        }
+
+        pickerPanel.hidden = false;
+        linkButton.disabled = false;
+      }
+
+      /** List the picked sheet's tabs so the user can choose where rows land. */
+      async function prepareBinding(spreadsheetId: string, name: string): Promise<void> {
+        // Surface the name captured from the Picker doc immediately (it is the
+        // file name), then fill in the tab list once Google responds — no page
+        // reload required. The link button stays disabled until tabs are known.
+        pendingSpreadsheetId = spreadsheetId;
+        pickedNameEl.textContent = name;
+        pickerPanel.hidden = false;
+        linkButton.disabled = true;
+
+        setStatus("Reading the spreadsheet…", "info");
+        try {
+          const response = await fetch(
+            `/api/sheets/spreadsheet?spreadsheetId=${encodeURIComponent(spreadsheetId)}`,
+          );
+          const data = await readJson(response);
+          if (!response.ok) {
+            setStatus(
+              errorMessage(data, "Could not read that spreadsheet."),
+              "error",
+            );
+            return;
+          }
+          const rawTabs = data?.sheetTitles;
+          const tabs = Array.isArray(rawTabs)
+            ? rawTabs.filter((value): value is string => typeof value === "string")
+            : [];
+          const title =
+            data && typeof data.title === "string" && data.title ? data.title : name;
+          showPickerPanel(spreadsheetId, title, tabs);
+          setStatus("Choose a tab, then link the sheet.", "info");
+        } catch (error) {
+          const detail = describeError(error);
+          console.error("[picker] read spreadsheet failed:", detail, error);
+          setStatus(
+            `Could not read that spreadsheet: ${detail}`,
+            "error",
+          );
+        }
+      }
+
+      function handlePickerResult(
+        data: PickerResponse,
+        google: GooglePickerNamespace,
+      ): void {
+        if (data.action === google.picker.Action.PICKED) {
+          const doc = data.docs?.[0];
+          if (!doc || !doc.id) {
+            setStatus("Google did not return a file. Please try again.", "error");
+            return;
+          }
+          void prepareBinding(doc.id, doc.name ?? "Selected spreadsheet");
+          return;
+        }
+        if (data.action === google.picker.Action.CANCEL) {
+          setStatus("No file selected.", "info");
+        }
+      }
+
+      createButton.addEventListener("click", async () => {
+        createButton.disabled = true;
+        setStatus("Creating your Google Sheet…", "info");
+        const data = await postSheetAction({ action: "create" });
+        if (data) {
+          const sheet = readLinkedSheet(data);
+          if (sheet) renderLinked(sheet);
+          pickerPanel.hidden = true;
+          pendingSpreadsheetId = null;
+          setStatus(
+            "Google Sheet created and linked. Open it from the link above.",
+            "success",
+          );
+        }
+        createButton.disabled = false;
+      });
+
+      browseButton.addEventListener("click", async () => {
+        if (!pickerApiKey) {
+          const reason =
+            "GOOGLE_PICKER_API_KEY is not configured for this deployment.";
+          console.error("[picker] PICKER_KEY_MISSING:", reason);
+          setStatus(`Cannot open Google Drive: ${reason}`, "warning");
+          return;
+        }
+        if (!pickerAppId) {
+          console.warn(
+            "[picker] GOOGLE_CLOUD_PROJECT_NUMBER is not set; Picker may fail on projects that require setAppId().",
+          );
+        }
+
+        browseButton.disabled = true;
+        setStatus("Opening Google Drive…", "info");
+        try {
+          const accessToken = await fetchAccessToken();
+
+          await loadPickerScript();
+
+          const globals = window as unknown as {
+            google?: GooglePickerNamespace;
+            gapi?: GapiNamespace;
+          };
+          // `api.js` only defines `window.gapi`; the `google.picker` namespace is
+          // not created until `gapi.load("picker", …)` finishes its callback, so
+          // it must never be checked before that call.
+          const gapi = globals.gapi;
+          if (!gapi) {
+            throw new PickerError(
+              "PICKER_GAPI_MISSING",
+              "api.js finished loading but window.gapi is undefined. The script was blocked (CSP/ad-blocker) or did not execute.",
+            );
+          }
+
+          await new Promise<void>((resolve, reject) => {
+            gapi.load("picker", {
+              callback: () => {
+                // Only now is `window.google.picker` guaranteed to be defined.
+                if (!globals.google?.picker) {
+                  reject(
+                    new PickerError(
+                      "PICKER_NAMESPACE_MISSING",
+                      "gapi.load('picker') completed but window.google.picker is still undefined. Enable the Google Picker API for this Cloud project.",
+                    ),
+                  );
+                  return;
+                }
+                resolve();
+              },
+              onerror: () =>
+                reject(
+                  new PickerError(
+                    "PICKER_GAPI_LOAD_ERROR",
+                    "gapi.load('picker') failed to fetch the picker module. Confirm the Google Picker API is enabled and the API key allows this origin.",
+                  ),
+                ),
+              // `timeout` must be paired with `ontimeout`, otherwise gapi.load throws.
+              ontimeout: () =>
+                reject(
+                  new PickerError(
+                    "PICKER_GAPI_TIMEOUT",
+                    `gapi.load('picker') timed out after ${PICKER_LOAD_TIMEOUT_MS}ms while fetching the picker module.`,
+                  ),
+                ),
+              timeout: PICKER_LOAD_TIMEOUT_MS,
+            });
+          });
+
+          const googleNs = globals.google;
+          if (!googleNs?.picker) {
+            throw new PickerError(
+              "PICKER_NAMESPACE_MISSING",
+              "The google.picker namespace is still unavailable after loading.",
+            );
+          }
+
+          const builder = new googleNs.picker.PickerBuilder()
+            .addView(googleNs.picker.ViewId.SPREADSHEETS)
+            .setOAuthToken(accessToken)
+            .setDeveloperKey(pickerApiKey)
+            .setCallback((data) => handlePickerResult(data, googleNs));
+          if (pickerAppId) builder.setAppId(pickerAppId);
+
+          try {
+            builder.build().setVisible(true);
+          } catch (error) {
+            throw new PickerError(
+              "PICKER_BUILD_ERROR",
+              `The Picker UI failed to open (appId: ${pickerAppId || "unset"}): ${describeError(error)}`,
+            );
+          }
+        } catch (error) {
+          console.error("[picker] open failed:", describeError(error), error);
+          setStatus(`Could not open Google Drive: ${describeError(error)}`, "error");
+        } finally {
+          browseButton.disabled = false;
+        }
+      });
+
+      linkButton.addEventListener("click", async () => {
+        if (!pendingSpreadsheetId) {
+          setStatus("Pick a spreadsheet first.", "warning");
+          return;
+        }
+        linkButton.disabled = true;
+        setStatus("Linking your sheet…", "info");
+        const data = await postSheetAction({
+          action: "bind",
+          spreadsheetId: pendingSpreadsheetId,
+          sheetTabName: tabSelect.value,
+        });
+        if (data) {
+          const sheet = readLinkedSheet(data);
+          if (sheet) renderLinked(sheet);
+          pickerPanel.hidden = true;
+          pendingSpreadsheetId = null;
+          setStatus("Sheet linked to your shelf.", "success");
+        }
+        linkButton.disabled = false;
+      });
+
+      pickerCancel.addEventListener("click", () => {
+        pickerPanel.hidden = true;
+        pendingSpreadsheetId = null;
+        setStatus("Selection cancelled.", "info");
+      });
+
+      detachButton.addEventListener("click", async () => {
+        detachButton.disabled = true;
+        setStatus("Unlinking your sheet…", "info");
+        const data = await postSheetAction({ action: "detach" });
+        if (data) {
+          summaryEl.textContent =
+            "No sheet linked yet. Create a new one in a click, or pick an existing sheet from Google Drive.";
+          setStatus("Sheet unlinked.", "success");
+          return;
+        }
+        detachButton.disabled = false;
+      });
+
+      prefsForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const selected = prefsForm.querySelector<HTMLInputElement>(
+          'input[name="visibility"]:checked',
+        );
+        saveButton.disabled = true;
+        setStatus("Saving preferences…", "info");
+        try {
+          const response = await fetch("/api/sheets/settings", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              defaultVisibility: selected?.value ?? "private",
+              allowIncomingTransfers: allowTransfers.checked,
+            }),
+          });
+          if (!response.ok) {
+            setStatus("Could not save preferences.", "error");
+            return;
+          }
+          setStatus("Preferences saved.", "success");
+        } catch {
+          setStatus("Network error while saving preferences.", "error");
+        } finally {
+          saveButton.disabled = false;
+        }
+      });
+    </script>
+
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: #0f1115;
+        color: #f5f6f8;
+      }
+
+      .app {
+        max-width: 32rem;
+        margin: 0 auto;
+        padding: 1.5rem;
+        display: grid;
+        gap: 1rem;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      .header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .subtitle,
+      .muted {
+        margin: 0;
+        opacity: 0.7;
+      }
+
+      .panel {
+        border: 1px solid #2a2f3a;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      .status {
+        margin: 0;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        background: #1b1f28;
+      }
+
+      .status[data-tone="warning"] {
+        background: #3a2f12;
+      }
+
+      .status[data-tone="error"] {
+        background: #3a1618;
+      }
+
+      .status[data-tone="success"] {
+        background: #12301c;
+      }
+
+      .picker-panel {
+        border: 1px dashed #3a4150;
+        border-radius: 0.5rem;
+        padding: 0.75rem;
+        display: grid;
+        gap: 0.5rem;
+      }
+
+      form {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      fieldset {
+        border: 1px solid #3a4150;
+        border-radius: 0.5rem;
+        display: flex;
+        gap: 1rem;
+      }
+
+      legend {
+        padding: 0 0.4rem;
+        opacity: 0.8;
+      }
+
+      label {
+        font-size: 0.9rem;
+      }
+
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      select {
+        flex: 1 1 12rem;
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+      }
+
+      button,
+      .button {
+        display: inline-block;
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .back {
+        margin: 0;
+        opacity: 0.7;
+      }
+    </style>
+  </body>
+</html>

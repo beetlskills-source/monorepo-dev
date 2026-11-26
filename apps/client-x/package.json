@@ -1,0 +1,27 @@
+{
+  "name": "client-x",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "node": ">=22.23.4"
+  },
+  "scripts": {
+    "dev": "astro dev --host",
+    "build": "astro build",
+    "preview": "astro preview",
+    "local": "astro build && wrangler dev",
+    "deploy": "astro build && wrangler deploy",
+    "astro": "astro",
+    "wrangler": "wrangler"
+  },
+  "dependencies": {
+    "@astrojs/cloudflare": "^14.4.9",
+    "astro": "^7.4.13",
+    "auth-contract": "workspace:*"
+  },
+  "devDependencies": {
+    "sandbox-mocks": "workspace:*",
+    "wrangler": "^4.166.0"
+  }
+}

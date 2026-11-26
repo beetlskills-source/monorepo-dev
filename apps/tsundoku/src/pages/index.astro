@@ -1,0 +1,704 @@
+---
+export const prerender = false;
+
+import { GROUP_INVITE_QUERY_PARAM } from "../lib/groups";
+
+// Phase 5: an invite link (`/?invite=<token>`) must survive the sign-in
+// round-trip. Send signed-out visitors to `/login` with the token carried in
+// `next`, and signed-in visitors straight to the dashboard to record it. The
+// token is only handed to the dashboard — no group details are revealed here.
+const inviteToken = Astro.url.searchParams.get(GROUP_INVITE_QUERY_PARAM);
+if (inviteToken) {
+  const next = `/dashboard?${GROUP_INVITE_QUERY_PARAM}=${encodeURIComponent(inviteToken)}`;
+  if (Astro.locals.user) {
+    return Astro.redirect(next);
+  }
+  return Astro.redirect(`/login?next=${encodeURIComponent(next)}`);
+}
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+    <title>Tsundoku — ISBN Scanner</title>
+  </head>
+  <body>
+    <main class="app">
+      <h1>ISBN Scanner</h1>
+      <p class="subtitle">
+        Scan a book barcode with your camera, or type an ISBN-10 / ISBN-13 below.
+      </p>
+
+      <p class="nav"><a href="/dashboard">Dashboard →</a></p>
+
+      <section class="panel" aria-label="Camera scanner">
+        <video id="preview" playsinline muted></video>
+        <div id="warning" class="warning" role="alert" hidden>
+          <p class="warning-text">
+            Scanner stalled or couldn't lock onto the barcode. Hold the ISBN
+            15–20 cm from the lens in good lighting, or tap Restart Camera.
+          </p>
+          <button id="restart" type="button">Restart Camera</button>
+        </div>
+        <div class="controls">
+          <button id="start" type="button">Start camera</button>
+          <button id="stop" type="button" disabled>Stop</button>
+          <button id="scan" type="button" disabled>Scan frame</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="Manual ISBN entry">
+        <form id="manual-form" autocomplete="off">
+          <label for="isbn-input">Manual ISBN</label>
+          <div class="controls">
+            <input
+              id="isbn-input"
+              name="isbn"
+              type="text"
+              inputmode="numeric"
+              placeholder="9780306406157"
+            />
+            <button id="lookup" type="submit">Look up</button>
+          </div>
+        </form>
+      </section>
+
+      <p id="status" class="status" role="status" data-tone="info">
+        Start the camera or enter an ISBN to begin.
+      </p>
+
+      <section id="result" class="result" aria-live="polite" hidden></section>
+    </main>
+
+    <script>
+      import {
+        BookLookupResultSchema,
+        type BookLookupResult,
+      } from "@repo/book-schemas";
+      import {
+        extractIsbnCandidates,
+        isDuplicateScan,
+        isVideoStalled,
+        type RecentScan,
+        type VideoHealthSample,
+      } from "../lib/scanner";
+
+      /** Show the restart warning once the feed/stall persists this long. */
+      const STALL_WARNING_MS = 8000;
+      /** Delay before re-acquiring the camera after releasing the old track. */
+      const RESTART_DELAY_MS = 300;
+      /** How often the health watchdog samples the video element. */
+      const WATCHDOG_INTERVAL_MS = 1000;
+
+      interface DetectedBarcode {
+        rawValue: string;
+      }
+
+      interface BarcodeDetectorLike {
+        detect(source: HTMLVideoElement): Promise<DetectedBarcode[]>;
+      }
+
+      type BarcodeDetectorConstructor = new (options: {
+        formats: string[];
+      }) => BarcodeDetectorLike;
+
+      const videoEl = document.getElementById("preview") as HTMLVideoElement | null;
+      const startButton = document.getElementById("start") as HTMLButtonElement | null;
+      const stopButton = document.getElementById("stop") as HTMLButtonElement | null;
+      const scanButton = document.getElementById("scan") as HTMLButtonElement | null;
+      const form = document.getElementById("manual-form") as HTMLFormElement | null;
+      const input = document.getElementById("isbn-input") as HTMLInputElement | null;
+      const lookupButton = document.getElementById("lookup") as HTMLButtonElement | null;
+      const statusEl = document.getElementById("status") as HTMLParagraphElement | null;
+      const resultEl = document.getElementById("result") as HTMLElement | null;
+      const warningEl = document.getElementById("warning") as HTMLDivElement | null;
+      const restartButton = document.getElementById("restart") as HTMLButtonElement | null;
+
+      let mediaStream: MediaStream | null = null;
+      let barcodeDetector: BarcodeDetectorLike | null = null;
+      let scanning = false;
+      let videoTrack: MediaStreamTrack | null = null;
+      let recentScan: RecentScan | null = null;
+      let scanStartedAt: number | null = null;
+      let watchdogTimer: number | null = null;
+      let lastVideoSample: VideoHealthSample | null = null;
+      let stalledSince: number | null = null;
+
+      function setStatus(message: string, tone?: string): void {
+        if (!statusEl) return;
+        statusEl.textContent = message;
+        statusEl.dataset.tone = tone || "info";
+      }
+
+      /** Toggle the manual-lookup loading state (disables the form controls). */
+      function setLoading(isLoading: boolean): void {
+        if (lookupButton) lookupButton.disabled = isLoading;
+        if (input) input.disabled = isLoading;
+      }
+
+      function showWarning(): void {
+        if (warningEl) warningEl.hidden = false;
+      }
+
+      function hideWarning(): void {
+        if (warningEl) warningEl.hidden = true;
+      }
+
+      /** Release the current stream and detach track listeners. */
+      function releaseStream(): void {
+        if (videoTrack) {
+          videoTrack.onended = null;
+          videoTrack.onmute = null;
+          videoTrack = null;
+        }
+        if (mediaStream) {
+          for (const track of mediaStream.getTracks()) track.stop();
+        }
+        mediaStream = null;
+        if (videoEl) videoEl.srcObject = null;
+      }
+
+      function isCameraActive(): boolean {
+        return mediaStream !== null && !!videoEl && videoEl.srcObject !== null;
+      }
+
+      /** Sample the feed and surface the restart warning if it stays broken. */
+      function checkCameraHealth(): void {
+        if (!videoEl || !isCameraActive() || document.hidden) return;
+
+        const now = Date.now();
+        const current: VideoHealthSample = {
+          readyState: videoEl.readyState,
+          currentTime: videoEl.currentTime,
+        };
+        const stalled = isVideoStalled(lastVideoSample, current);
+        lastVideoSample = current;
+
+        if (stalled) {
+          if (stalledSince === null) stalledSince = now;
+        } else {
+          stalledSince = null;
+        }
+
+        const videoFrozen =
+          stalledSince !== null && now - stalledSince >= STALL_WARNING_MS;
+        const scanStuck =
+          scanning &&
+          scanStartedAt !== null &&
+          now - scanStartedAt >= STALL_WARNING_MS;
+
+        if (videoFrozen || scanStuck) {
+          showWarning();
+        } else {
+          hideWarning();
+        }
+      }
+
+      function startWatchdog(): void {
+        stopWatchdog();
+        watchdogTimer = window.setInterval(checkCameraHealth, WATCHDOG_INTERVAL_MS);
+      }
+
+      function stopWatchdog(): void {
+        if (watchdogTimer !== null) {
+          window.clearInterval(watchdogTimer);
+          watchdogTimer = null;
+        }
+        lastVideoSample = null;
+        stalledSince = null;
+      }
+
+      function attachTrackListeners(stream: MediaStream): void {
+        const [track] = stream.getVideoTracks();
+        videoTrack = track ?? null;
+        if (!videoTrack) return;
+        videoTrack.onended = () => {
+          setStatus(
+            "The camera stopped unexpectedly. Tap Restart Camera to reconnect.",
+            "error",
+          );
+          showWarning();
+        };
+        videoTrack.onmute = () => {
+          setStatus(
+            "The camera feed was interrupted. Tap Restart Camera to reconnect.",
+            "warning",
+          );
+          showWarning();
+        };
+      }
+
+      function renderResult(book: BookLookupResult): void {
+        if (!resultEl) return;
+        resultEl.hidden = false;
+        resultEl.replaceChildren();
+
+        const title = document.createElement("h2");
+        title.textContent = book.title;
+        resultEl.appendChild(title);
+
+        if (book.authors.length > 0) {
+          const authors = document.createElement("p");
+          authors.textContent = `by ${book.authors.join(", ")}`;
+          resultEl.appendChild(authors);
+        }
+
+        const meta: string[] = [];
+        if (book.publisher) meta.push(book.publisher);
+        if (book.publishedYear) meta.push(String(book.publishedYear));
+        if (meta.length > 0) {
+          const metaEl = document.createElement("p");
+          metaEl.textContent = meta.join(" · ");
+          resultEl.appendChild(metaEl);
+        }
+
+        if (book.summary) {
+          const summaryEl = document.createElement("p");
+          summaryEl.textContent = book.summary;
+          resultEl.appendChild(summaryEl);
+        }
+
+        const isbnEl = document.createElement("p");
+        isbnEl.textContent = `ISBN-13: ${book.isbn13}`;
+        resultEl.appendChild(isbnEl);
+
+        const provenanceEl = document.createElement("p");
+        provenanceEl.textContent = `Source: ${book.source} · ${
+          book.verified ? "verified" : "unverified"
+        } · ${book.enriched ? "enriched" : "not enriched"} · Confidence: ${
+          book.confidence
+        }`;
+        resultEl.appendChild(provenanceEl);
+
+        const saveButton = document.createElement("button");
+        saveButton.type = "button";
+        saveButton.id = "save-to-shelf";
+        saveButton.textContent = "Save to my shelf";
+        saveButton.addEventListener("click", () => {
+          void saveToShelf(book, saveButton);
+        });
+        resultEl.appendChild(saveButton);
+      }
+
+      /** Persist a looked-up book into the signed-in user's personal sheet. */
+      async function saveToShelf(
+        book: BookLookupResult,
+        button: HTMLButtonElement,
+      ): Promise<void> {
+        button.disabled = true;
+        setStatus("Saving to your shelf…", "info");
+
+        let response: Response;
+        try {
+          response = await fetch("/api/sheets/save-book", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ book }),
+          });
+        } catch {
+          setStatus("Network error while saving to your shelf.", "error");
+          button.disabled = false;
+          return;
+        }
+
+        let data: unknown = null;
+        try {
+          data = await response.json();
+        } catch {
+          data = null;
+        }
+
+        if (!response.ok) {
+          const message =
+            data !== null &&
+            typeof data === "object" &&
+            typeof (data as { message?: unknown }).message === "string"
+              ? (data as { message: string }).message
+              : "Could not save this book.";
+          const hint =
+            response.status === 401 || response.status === 409
+              ? " Open your dashboard to sign in or connect a Google Sheet."
+              : "";
+          setStatus(`${message}${hint}`, response.status === 401 ? "warning" : "error");
+          button.disabled = false;
+          return;
+        }
+
+        setStatus("Saved to your Google Sheet.", "success");
+        button.textContent = "Saved";
+      }
+
+      async function startCamera(): Promise<void> {
+        if (!videoEl) return;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setStatus(
+            "Camera is unavailable in this browser. Enter an ISBN manually.",
+            "warning",
+          );
+          return;
+        }
+
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment" },
+          });
+        } catch {
+          setStatus(
+            "Camera permission denied. Enter an ISBN manually.",
+            "warning",
+          );
+          return;
+        }
+
+        videoEl.srcObject = mediaStream;
+        await videoEl.play();
+
+        const Detector = (
+          window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }
+        ).BarcodeDetector;
+        if (Detector) {
+          try {
+            barcodeDetector = new Detector({
+              formats: ["ean_13", "ean_8", "code_128"],
+            });
+          } catch {
+            barcodeDetector = null;
+          }
+        }
+
+        scanning = false;
+        scanStartedAt = null;
+        recentScan = null;
+        attachTrackListeners(mediaStream);
+        startWatchdog();
+        hideWarning();
+
+        if (startButton) startButton.disabled = true;
+        if (stopButton) stopButton.disabled = false;
+        if (scanButton) scanButton.disabled = false;
+        setStatus("Camera ready. Aim at the barcode and scan.", "info");
+      }
+
+      function stopCamera(): void {
+        stopWatchdog();
+        hideWarning();
+        releaseStream();
+        scanning = false;
+        scanStartedAt = null;
+        if (startButton) startButton.disabled = false;
+        if (stopButton) stopButton.disabled = true;
+        if (scanButton) scanButton.disabled = true;
+        setStatus("Camera stopped.", "info");
+      }
+
+      /** Stop the current stream, wait briefly, then re-acquire the camera. */
+      async function restartCamera(): Promise<void> {
+        if (restartButton) restartButton.disabled = true;
+        setStatus("Restarting camera…", "info");
+        stopWatchdog();
+        hideWarning();
+        releaseStream();
+        scanning = false;
+        scanStartedAt = null;
+        await new Promise((resolve) => window.setTimeout(resolve, RESTART_DELAY_MS));
+        await startCamera();
+        if (restartButton) restartButton.disabled = false;
+      }
+
+      async function detectBarcodeText(): Promise<string> {
+        if (!videoEl) {
+          throw new Error("Video element is unavailable");
+        }
+
+        if (barcodeDetector) {
+          const codes = await barcodeDetector.detect(videoEl);
+          return codes.map((code) => code.rawValue).join("\n");
+        }
+
+        const { BrowserMultiFormatReader } = await import("@zxing/browser");
+        const reader = new BrowserMultiFormatReader();
+        const result = await reader.decodeOnceFromVideoElement(videoEl);
+        return result.getText();
+      }
+
+      async function lookup(rawIsbn: string): Promise<void> {
+        const [candidate] = extractIsbnCandidates(rawIsbn);
+        if (!candidate) {
+          setStatus(
+            "That is not a valid ISBN-10 or ISBN-13. Check the number and try again.",
+            "warning",
+          );
+          return;
+        }
+
+        setLoading(true);
+        setStatus(`Looking up ${candidate}…`, "info");
+
+        try {
+          let response: Response;
+          try {
+            response = await fetch("/api/isbn-lookup", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ isbn: candidate }),
+            });
+          } catch {
+            setStatus(
+              "Network error while contacting the lookup service.",
+              "error",
+            );
+            return;
+          }
+
+          let data: unknown = null;
+          try {
+            data = await response.json();
+          } catch {
+            data = null;
+          }
+
+          if (!response.ok) {
+            const message =
+              data !== null &&
+              typeof data === "object" &&
+              typeof (data as { message?: unknown }).message === "string"
+                ? (data as { message: string }).message
+                : "The lookup failed.";
+            setStatus(message, "error");
+            return;
+          }
+
+          const parsed = BookLookupResultSchema.safeParse(data);
+          if (!parsed.success) {
+            setStatus(
+              "The lookup returned an unexpected response. Please try again.",
+              "error",
+            );
+            return;
+          }
+
+          renderResult(parsed.data);
+          setStatus("Match found.", "success");
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function handleScan(): Promise<void> {
+        if (!videoEl || scanning) return;
+        scanning = true;
+        scanStartedAt = Date.now();
+        if (scanButton) scanButton.disabled = true;
+        setStatus("Scanning…", "info");
+
+        try {
+          let text = "";
+          try {
+            text = (await detectBarcodeText()) || "";
+          } catch {
+            setStatus(
+              "Could not read a barcode in this frame. Try again or type it manually.",
+              "warning",
+            );
+          }
+
+          const [candidate] = extractIsbnCandidates(text);
+          if (!candidate) {
+            if (text) {
+              setStatus(
+                "That barcode is not a valid ISBN. Enter it manually instead.",
+                "warning",
+              );
+            }
+          } else if (isDuplicateScan(recentScan, candidate, Date.now())) {
+            setStatus(
+              "That ISBN was just scanned. Move to the next book.",
+              "info",
+            );
+          } else {
+            recentScan = { isbn: candidate, at: Date.now() };
+            if (input) input.value = candidate;
+            await lookup(candidate);
+          }
+        } finally {
+          scanning = false;
+          scanStartedAt = null;
+          if (scanButton) scanButton.disabled = false;
+        }
+      }
+
+      startButton?.addEventListener("click", () => {
+        void startCamera();
+      });
+      stopButton?.addEventListener("click", stopCamera);
+      scanButton?.addEventListener("click", () => {
+        void handleScan();
+      });
+      restartButton?.addEventListener("click", () => {
+        void restartCamera();
+      });
+
+      // Returning to the tab invalidates stale samples; hidden tabs skip checks.
+      document.addEventListener("visibilitychange", () => {
+        lastVideoSample = null;
+        stalledSince = null;
+      });
+
+      form?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (!input) return;
+        const value = input.value.trim();
+        if (!value) {
+          setStatus("Enter an ISBN before looking up.", "warning");
+          return;
+        }
+        void lookup(value);
+      });
+    </script>
+
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: #0f1115;
+        color: #f5f6f8;
+      }
+
+      .app {
+        max-width: 32rem;
+        margin: 0 auto;
+        padding: 1.5rem;
+        display: grid;
+        gap: 1rem;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+
+      .subtitle {
+        margin: 0;
+        opacity: 0.7;
+      }
+
+      .nav {
+        margin: 0;
+      }
+
+      .nav a {
+        color: inherit;
+        font-weight: 600;
+      }
+
+      .panel {
+        border: 1px solid #2a2f3a;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      video {
+        width: 100%;
+        aspect-ratio: 4 / 3;
+        background: #000;
+        border-radius: 0.5rem;
+      }
+
+      .warning {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #7a5a1a;
+        background: #3a2f12;
+      }
+
+      .warning[hidden] {
+        display: none;
+      }
+
+      .warning-text {
+        margin: 0;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      button {
+        flex: 1 1 auto;
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      label {
+        font-size: 0.85rem;
+        opacity: 0.8;
+      }
+
+      input {
+        flex: 1 1 12rem;
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+      }
+
+      .status {
+        margin: 0;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        background: #1b1f28;
+      }
+
+      .status[data-tone="warning"] {
+        background: #3a2f12;
+      }
+
+      .status[data-tone="error"] {
+        background: #3a1618;
+      }
+
+      .status[data-tone="success"] {
+        background: #12301c;
+      }
+
+      .result {
+        border: 1px solid #2a2f3a;
+        border-radius: 0.75rem;
+        padding: 1rem;
+      }
+
+      .result h2 {
+        margin-top: 0;
+      }
+
+      .result p {
+        margin: 0.25rem 0;
+      }
+    </style>
+  </body>
+</html>

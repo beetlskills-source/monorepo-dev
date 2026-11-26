@@ -1,0 +1,428 @@
+---
+import { env } from "cloudflare:workers";
+import { safeNextPath } from "../lib/auth-guard";
+
+export const prerender = false;
+
+// Already-signed-in visitors skip the form entirely.
+if (Astro.locals.user) {
+  return Astro.redirect("/dashboard");
+}
+
+const next = safeNextPath(Astro.url.searchParams.get("next"));
+
+// Only advertise OAuth providers that have credentials configured server-side,
+// so a click can never land on a provider Better Auth has not registered.
+const providers: { id: "github" | "google" | "microsoft"; label: string }[] = [];
+if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) {
+  providers.push({ id: "github", label: "Continue with GitHub" });
+}
+if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
+  providers.push({ id: "google", label: "Continue with Google" });
+}
+if (env.MICROSOFT_CLIENT_ID && env.MICROSOFT_CLIENT_SECRET) {
+  providers.push({ id: "microsoft", label: "Continue with Microsoft" });
+}
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+    <title>Sign in — Tsundoku</title>
+  </head>
+  <body data-next={next}>
+    <main class="app">
+      <h1>Sign in to Tsundoku</h1>
+      <p class="subtitle">
+        Your personal reading shelf. Sign in to scan, save, and share books.
+      </p>
+
+      {
+        providers.length > 0 && (
+          <section class="panel oauth" aria-label="Social sign-in">
+            {providers.map((provider) => (
+              <button
+                type="button"
+                class="oauth-button"
+                data-provider={provider.id}
+              >
+                {provider.label}
+              </button>
+            ))}
+          </section>
+        )
+      }
+
+      <section class="panel" aria-label="Email sign-in">
+        <form id="auth-form" autocomplete="on">
+          <label for="name-input" id="name-label" hidden>
+            Name
+            <input id="name-input" name="name" type="text" autocomplete="name" />
+          </label>
+
+          <label for="email-input">
+            Email
+            <input
+              id="email-input"
+              name="email"
+              type="email"
+              autocomplete="email"
+              required
+            />
+          </label>
+
+          <label for="password-input">
+            Password
+            <input
+              id="password-input"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              minlength={8}
+              required
+            />
+          </label>
+
+          <button type="submit" id="submit-button">Sign in</button>
+        </form>
+
+        <div class="links">
+          <button type="button" id="toggle-mode" class="link">
+            Create an account
+          </button>
+          <button type="button" id="forgot-button" class="link">
+            Forgot password?
+          </button>
+        </div>
+      </section>
+
+      <p id="status" class="status" role="status" data-tone="info" hidden></p>
+
+      <p class="back"><a href="/">← Back to the scanner</a></p>
+    </main>
+
+    <script>
+      import { createAuthClient } from "better-auth/client";
+
+      const authClient = createAuthClient();
+      const nextUrl = document.body.dataset.next || "/dashboard";
+
+      const form = document.getElementById("auth-form") as HTMLFormElement | null;
+      const nameLabel = document.getElementById("name-label") as HTMLElement | null;
+      const nameInput = document.getElementById("name-input") as HTMLInputElement | null;
+      const emailInput = document.getElementById("email-input") as HTMLInputElement | null;
+      const passwordInput = document.getElementById("password-input") as HTMLInputElement | null;
+      const submitButton = document.getElementById("submit-button") as HTMLButtonElement | null;
+      const toggleMode = document.getElementById("toggle-mode") as HTMLButtonElement | null;
+      const forgotButton = document.getElementById("forgot-button") as HTMLButtonElement | null;
+      const statusEl = document.getElementById("status") as HTMLParagraphElement | null;
+
+      let mode: "signin" | "signup" | "forgot" = "signin";
+      let busy = false;
+
+      function setStatus(message: string, tone = "info"): void {
+        if (!statusEl) return;
+        statusEl.hidden = message === "";
+        statusEl.textContent = message;
+        statusEl.dataset.tone = tone;
+      }
+
+      function setMode(next: "signin" | "signup" | "forgot"): void {
+        mode = next;
+        const isForgot = next === "forgot";
+        const isSignup = next === "signup";
+
+        if (nameLabel) nameLabel.hidden = !isSignup;
+        if (passwordInput) {
+          passwordInput.autocomplete = isSignup
+            ? "new-password"
+            : "current-password";
+          passwordInput.hidden = isForgot;
+        }
+        if (submitButton) {
+          submitButton.textContent = isForgot
+            ? "Send reset link"
+            : isSignup
+              ? "Create account"
+              : "Sign in";
+        }
+        if (toggleMode) {
+          toggleMode.textContent = isSignup
+            ? "I already have an account"
+            : "Create an account";
+        }
+        if (forgotButton) forgotButton.hidden = isSignup || isForgot;
+        setStatus("");
+      }
+
+      function setBusy(value: boolean): void {
+        busy = value;
+        if (submitButton) submitButton.disabled = value;
+      }
+
+      function describeError(error: { message?: string; code?: string } | null): string {
+        if (!error) return "Something went wrong. Please try again.";
+        switch (error.code) {
+          case "EMAIL_NOT_VERIFIED":
+            return "Please verify your email first — check your inbox for the link.";
+          case "INVALID_EMAIL_OR_PASSWORD":
+            return "Invalid email or password.";
+          case "USER_ALREADY_EXISTS":
+            return "An account with that email already exists.";
+          default:
+            return error.message || "Something went wrong. Please try again.";
+        }
+      }
+
+      for (const button of document.querySelectorAll<HTMLButtonElement>(
+        ".oauth-button",
+      )) {
+        button.addEventListener("click", () => {
+          const provider = button.dataset.provider;
+          if (!provider || busy) return;
+          setBusy(true);
+          setStatus("Redirecting…", "info");
+
+          const fail = (message: string): void => {
+            setBusy(false);
+            setStatus(message, "error");
+          };
+
+          // Safety net: if we never actually leave the page the redirect was
+          // blocked or the URL was unusable — surface it instead of hanging.
+          window.setTimeout(() => {
+            if (busy) fail("Could not reach the provider. Please try again.");
+          }, 4000);
+
+          void authClient.signIn
+            .social({
+              provider: provider as "github" | "google" | "microsoft",
+              callbackURL: nextUrl,
+              errorCallbackURL: "/login",
+            })
+            .then(({ data, error }) => {
+              if (error) {
+                fail(describeError(error));
+                return;
+              }
+              // Older clients do not auto-redirect; fall back to a manual hop.
+              const url =
+                data && "url" in data && typeof data.url === "string"
+                  ? data.url
+                  : "";
+              if (url) {
+                window.location.href = url;
+                return;
+              }
+              fail("Could not start sign-in. Please try again.");
+            })
+            .catch((cause: unknown) => {
+              fail(
+                cause instanceof Error && cause.message
+                  ? `Sign-in failed: ${cause.message}`
+                  : "Sign-in failed. Please try again.",
+              );
+            });
+        });
+      }
+
+      toggleMode?.addEventListener("click", () => {
+        setMode(mode === "signup" ? "signin" : "signup");
+      });
+
+      forgotButton?.addEventListener("click", () => {
+        setMode("forgot");
+      });
+
+      form?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (busy) return;
+
+        const email = emailInput?.value.trim() ?? "";
+        const password = passwordInput?.value ?? "";
+        const name = nameInput?.value.trim() ?? "";
+
+        if (!email) {
+          setStatus("Enter your email address.", "warning");
+          return;
+        }
+
+        setBusy(true);
+        setStatus("Working…", "info");
+
+        const done = (message: string, tone = "success"): void => {
+          setBusy(false);
+          setStatus(message, tone);
+        };
+        const failed = (error: { message?: string; code?: string } | null): void => {
+          setBusy(false);
+          setStatus(describeError(error), "error");
+        };
+
+        if (mode === "forgot") {
+          void authClient
+            .requestPasswordReset({ email, redirectTo: "/reset-password" })
+            .then(({ error }) =>
+              error
+                ? failed(error)
+                : done("If that email exists, a reset link is on its way."),
+            );
+          return;
+        }
+
+        if (mode === "signup") {
+          if (password.length < 8) {
+            setBusy(false);
+            setStatus("Passwords must be at least 8 characters.", "warning");
+            return;
+          }
+          if (!name) {
+            setBusy(false);
+            setStatus("Enter your name.", "warning");
+            return;
+          }
+          void authClient.signUp
+            .email({ email, password, name, callbackURL: nextUrl })
+            .then(({ error }) =>
+              error
+                ? failed(error)
+                : done("Account created — check your inbox to verify your email."),
+            );
+          return;
+        }
+
+        void authClient.signIn
+          .email({ email, password, callbackURL: nextUrl })
+          .then(({ error }) => {
+            if (error) {
+              failed(error);
+              return;
+            }
+            window.location.href = nextUrl;
+          });
+      });
+
+      setMode("signin");
+    </script>
+
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: #0f1115;
+        color: #f5f6f8;
+      }
+
+      .app {
+        max-width: 26rem;
+        margin: 0 auto;
+        padding: 1.5rem;
+        display: grid;
+        gap: 1rem;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+
+      .subtitle {
+        margin: 0;
+        opacity: 0.7;
+      }
+
+      .panel {
+        border: 1px solid #2a2f3a;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .oauth {
+        gap: 0.5rem;
+      }
+
+      form {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      label {
+        display: grid;
+        gap: 0.35rem;
+        font-size: 0.85rem;
+        opacity: 0.85;
+      }
+
+      input {
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+      }
+
+      button {
+        padding: 0.6rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid #3a4150;
+        background: #1b1f28;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .links {
+        display: flex;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+
+      .link {
+        border: none;
+        background: none;
+        padding: 0;
+        color: #7aa2f7;
+        text-decoration: underline;
+      }
+
+      .status {
+        margin: 0;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        background: #1b1f28;
+      }
+
+      .status[data-tone="warning"] {
+        background: #3a2f12;
+      }
+
+      .status[data-tone="error"] {
+        background: #3a1618;
+      }
+
+      .status[data-tone="success"] {
+        background: #12301c;
+      }
+
+      .back {
+        margin: 0;
+        opacity: 0.7;
+      }
+    </style>
+  </body>
+</html>

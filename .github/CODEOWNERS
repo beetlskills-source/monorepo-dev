@@ -1,0 +1,14 @@
+# Each line is a file path pattern followed by one or more owner handles.
+# The owner here is your GitHub username (e.g., @beetlskills-source).
+
+# 1. Lock down core plumbing (packages/) - requires your review
+/packages/ *@beetlskills-source
+
+# 2. Lock down immutable data contracts (contracts/) - requires your review
+/contracts/ *@beetlskills-source
+
+# 3. Lock down global CI/CD pipelines and workflow configurations
+/.github/workflows/ *@beetlskills-source
+
+# 4. Client apps (apps/) are open for assistant/developer work
+# (No rule needed here, meaning anyone can commit to apps/client-X freely)

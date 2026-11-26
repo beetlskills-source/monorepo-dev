@@ -1,0 +1,41 @@
+{
+	"name": "tsundoku",
+	"main": "@astrojs/cloudflare/entrypoints/server",
+	"compatibility_date": "2026-11-24",
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
+	"assets": {
+		"binding": "ASSETS",
+		"directory": "./dist"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"dev": {
+		"ip": "localhost",
+		"port": 8787
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "tsundoku",
+			"database_id": "97f88d40-f7c5-49a1-aa21-d683c9774a1a",
+			"migrations_dir": "migrations"
+		}
+	],
+	// Optional KV cache for shared-shelf reads. Create one with
+	// `wrangler kv namespace create SHELF_CACHE`, then uncomment and paste the
+	// returned id. Without this binding, shared shelves are fetched live on
+	// every request (safe fallback — no error).
+	// "kv_namespaces": [
+	// 	{ "binding": "SHELF_CACHE", "id": "<your-kv-namespace-id>" }
+	// ],
+	"routes": [
+		{
+			"pattern": "tsundoku.singbaobao.com",
+			"custom_domain": true
+		}
+	]
+}

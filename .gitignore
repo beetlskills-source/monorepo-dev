@@ -1,0 +1,10 @@
+node_modules/
+.turbo/
+dist/
+.astro/
+.wrangler/
+.pnpm-store/
+.pnpm-cache/
+.env
+.env.*
+!.env.example

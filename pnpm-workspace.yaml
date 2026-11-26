@@ -1,0 +1,9 @@
+packages:
+  - "contracts/*"
+  - "packages/*"
+  - "apps/*"
+  - "tooling/*"
+  - "packages/domains/*/*"
+allowBuilds:
+  esbuild: true
+  workerd: true
