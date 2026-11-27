@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyRowEdits,
   filterSharedRows,
+  hasBlankSummary,
   isHeaderRow,
   isEmptyRow,
   isSharedRow,
@@ -15,6 +16,7 @@ import {
   shelfColumnRange,
   shelfRowRange,
   shelfRowToValues,
+  shelfSummaryRange,
   type ShelfRow,
 } from "../lib/shelf-rows";
 import { SHEET_HEADER_ROW } from "../lib/sheet-flow";
@@ -152,6 +154,38 @@ describe("range helpers", () => {
     expect(shelfColumnRange("Books")).toBe("'Books'!A1:O");
     expect(shelfRowRange("Books", 2)).toBe("'Books'!A2:O2");
     expect(shelfRowRange("O'Brien", 10)).toBe("'O''Brien'!A10:O10");
+  });
+
+  it("targets just the summary cell (column F) for a batch backfill", () => {
+    expect(shelfSummaryRange("Books", 2)).toBe("'Books'!F2");
+    expect(shelfSummaryRange("Books", 42)).toBe("'Books'!F42");
+    expect(shelfSummaryRange("O'Brien", 3)).toBe("'O''Brien'!F3");
+  });
+});
+
+describe("hasBlankSummary", () => {
+  it("flags blank and whitespace-only summaries", () => {
+    expect(hasBlankSummary(shelfRowFromCanonical(2, dataRow))).toBe(false);
+    const blank = shelfRowFromCanonical(2, [
+      "9780306406157",
+      "Title",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+    ]);
+    expect(hasBlankSummary(blank)).toBe(true);
+    expect(hasBlankSummary({ ...blank, summary: "   " })).toBe(true);
+    expect(hasBlankSummary({ ...blank, summary: "Kept." })).toBe(false);
   });
 });
 

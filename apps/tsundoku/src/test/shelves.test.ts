@@ -10,6 +10,7 @@ import {
   loadSharedShelves,
   SHARED_SHELF_CACHE_TTL_SECONDS,
   sharedShelfCacheKey,
+  toPublicSharedShelf,
 } from "../lib/shelves";
 
 const KEY = "test-encryption-key";
@@ -526,5 +527,36 @@ describe("describeShelfError", () => {
 
   it("falls back to a generic message for unknown errors", () => {
     expect(describeShelfError(new Error("boom"))).toMatch(/went wrong/i);
+  });
+});
+
+describe("toPublicSharedShelf", () => {
+  it("strips the owner's spreadsheet id, tab name, and title", () => {
+    const publicShelf = toPublicSharedShelf({
+      ownerId: "owner-1",
+      ownerEmail: "owner@example.com",
+      ownerName: "Owner One",
+      spreadsheetId: "secret-sheet-id",
+      sheetTabName: "Books",
+      title: "Owner Shelf",
+      status: "ok",
+      message: null,
+      groupIds: ["group-1"],
+      rows: [],
+    });
+
+    expect(publicShelf).toEqual({
+      ownerId: "owner-1",
+      ownerEmail: "owner@example.com",
+      ownerName: "Owner One",
+      status: "ok",
+      message: null,
+      groupIds: ["group-1"],
+      rows: [],
+    });
+    // A viewer can never locate or open the owner's underlying Google Sheet.
+    expect(publicShelf).not.toHaveProperty("spreadsheetId");
+    expect(publicShelf).not.toHaveProperty("sheetTabName");
+    expect(publicShelf).not.toHaveProperty("title");
   });
 });

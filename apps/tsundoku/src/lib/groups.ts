@@ -47,6 +47,15 @@ export interface GroupSummary {
   inviteToken: string | null;
 }
 
+/** One active member of a group, resolved for the membership view. */
+export interface GroupMemberView {
+  userId: string;
+  name: string | null;
+  email: string | null;
+  role: GroupRole;
+  isAdmin: boolean;
+}
+
 /** A single user-specific invitation, resolved for the invitation inbox. */
 export interface GroupInvitationView {
   id: string;
@@ -240,6 +249,41 @@ export async function isActiveMember(
     .bind(groupId, userId)
     .first<{ status: string }>();
   return row?.status === "active";
+}
+
+/**
+ * List a group's `active` members (admins first), resolving each member's
+ * display name/email from the auth `user` table. Callers must confirm the
+ * requester is a member before exposing this roster.
+ */
+export async function listGroupMembers(
+  db: D1Database,
+  groupId: string,
+): Promise<GroupMemberView[]> {
+  const result = await db
+    .prepare(
+      `SELECT m.user_id AS user_id, m.role AS role,
+              u.name AS name, u.email AS email
+         FROM group_memberships m
+         LEFT JOIN "user" u ON u.id = m.user_id
+        WHERE m.group_id = ? AND m.status = 'active'
+        ORDER BY CASE m.role WHEN 'admin' THEN 0 ELSE 1 END, u.name, u.email`,
+    )
+    .bind(groupId)
+    .all<{
+      user_id: string;
+      role: string;
+      name: string | null;
+      email: string | null;
+    }>();
+
+  return (result?.results ?? []).map((row) => ({
+    userId: row.user_id,
+    name: row.name ?? null,
+    email: row.email ?? null,
+    role: row.role === "admin" ? "admin" : "member",
+    isAdmin: row.role === "admin",
+  }));
 }
 
 /**
@@ -444,6 +488,109 @@ export async function respondToInvitation(
   return true;
 }
 
+/** Result of the caller leaving a group (or deleting it as its admin). */
+export type ExitGroupOutcome = "left" | "deleted";
+
+/**
+ * Delete a group and everything scoped to it. D1 has no interactive
+ * transaction helper, so the deletes run as one ordered `batch` (an implicit
+ * transaction): pending invitations first, then memberships, then the group row
+ * last — the row's own `invite_token` is the invite link, so removing the row
+ * also retires every shared link. Row-level group tags live in each member's
+ * Google Sheet and are intentionally left alone (personal books are never
+ * deleted); they become inert because visibility is always resolved against
+ * active co-membership, which this removes.
+ */
+async function deleteGroupCascade(db: D1Database, groupId: string): Promise<void> {
+  await db.batch([
+    db.prepare(`DELETE FROM group_invitations WHERE group_id = ?`).bind(groupId),
+    db.prepare(`DELETE FROM group_memberships WHERE group_id = ?`).bind(groupId),
+    db.prepare(`DELETE FROM "groups" WHERE id = ?`).bind(groupId),
+  ]);
+}
+
+/**
+ * Exit a group, or — when the caller is its admin — delete it outright.
+ *
+ * - A `member` removes only their own membership record, so the group and every
+ *   other member stay intact.
+ * - An `admin` triggers the full cascade (invitations, memberships, the group
+ *   row and its invite token) for everyone, as if the group never existed.
+ *
+ * The role is resolved from the caller's own active membership, so a member can
+ * never trigger a group-wide deletion. Returns `null` when the caller is not an
+ * active member, so a stale or forged groupId mutates nothing.
+ */
+export async function exitGroup(
+  db: D1Database,
+  input: { groupId: string; userId: string },
+): Promise<ExitGroupOutcome | null> {
+  const membership = await db
+    .prepare(
+      `SELECT role FROM group_memberships
+        WHERE group_id = ? AND user_id = ? AND status = 'active'
+        LIMIT 1`,
+    )
+    .bind(input.groupId, input.userId)
+    .first<{ role: string }>();
+  if (!membership) return null;
+
+  if (membership.role === "admin") {
+    await deleteGroupCascade(db, input.groupId);
+    return "deleted";
+  }
+
+  await db
+    .prepare(
+      `DELETE FROM group_memberships
+        WHERE group_id = ? AND user_id = ? AND role = 'member'`,
+    )
+    .bind(input.groupId, input.userId)
+    .run();
+  return "left";
+}
+
+/** Result of an admin removing one member from their group. */
+export type RemoveMemberOutcome = "removed" | "not_admin" | "not_member";
+
+/**
+ * Remove one member from a group. Only the group's admin may do so — the same
+ * `admin_user_id` check the invite-token rotation uses — and the admin row
+ * itself is never removable here: an admin leaves via `exitGroup`, which
+ * deletes the whole group. The admin is refused server-side regardless of what
+ * the client sends, so a member can never be removed by another member and the
+ * admin can never be removed without deleting the group.
+ */
+export async function removeGroupMember(
+  db: D1Database,
+  input: { groupId: string; requesterId: string; targetUserId: string },
+): Promise<RemoveMemberOutcome> {
+  const group = await db
+    .prepare(`SELECT id FROM "groups" WHERE id = ? AND admin_user_id = ? LIMIT 1`)
+    .bind(input.groupId, input.requesterId)
+    .first<{ id: string }>();
+  if (!group) return "not_admin";
+
+  const target = await db
+    .prepare(
+      `SELECT role FROM group_memberships
+        WHERE group_id = ? AND user_id = ? AND status = 'active'
+        LIMIT 1`,
+    )
+    .bind(input.groupId, input.targetUserId)
+    .first<{ role: string }>();
+  if (!target || target.role === "admin") return "not_member";
+
+  await db
+    .prepare(
+      `DELETE FROM group_memberships
+        WHERE group_id = ? AND user_id = ? AND role = 'member'`,
+    )
+    .bind(input.groupId, input.targetUserId)
+    .run();
+  return "removed";
+}
+
 /** Body for `POST /api/groups`. */
 export const CreateGroupRequestSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -465,3 +612,18 @@ export const InvitationRespondSchema = z.object({
 });
 
 export type InvitationRespondRequest = z.infer<typeof InvitationRespondSchema>;
+
+/** Body for `DELETE /api/groups/membership`. */
+export const ExitGroupSchema = z.object({
+  groupId: z.string().trim().min(1),
+});
+
+export type ExitGroupRequest = z.infer<typeof ExitGroupSchema>;
+
+/** Body for `DELETE /api/groups/members`. */
+export const RemoveGroupMemberSchema = z.object({
+  groupId: z.string().trim().min(1),
+  userId: z.string().trim().min(1),
+});
+
+export type RemoveGroupMemberRequest = z.infer<typeof RemoveGroupMemberSchema>;

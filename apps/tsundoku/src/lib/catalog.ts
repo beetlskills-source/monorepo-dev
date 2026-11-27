@@ -1,4 +1,15 @@
-import { CatalogBookSchema, type CatalogBook } from "@repo/book-schemas";
+import {
+  CatalogBookSchema,
+  CatalogEditionSchema,
+  type CatalogBook,
+  type CatalogEdition,
+} from "@repo/book-schemas";
+import {
+  isbn10ToIsbn13,
+  isValidIsbn10,
+  isValidIsbn13,
+  normalizeIsbn,
+} from "@repo/isbn";
 
 /**
  * Catalog-first lookup client. Open Library is the primary provider; Google
@@ -8,12 +19,16 @@ import { CatalogBookSchema, type CatalogBook } from "@repo/book-schemas";
  */
 
 export const OPEN_LIBRARY_ENDPOINT = "https://openlibrary.org/api/books";
+export const OPEN_LIBRARY_SEARCH_ENDPOINT = "https://openlibrary.org/search.json";
 export const GOOGLE_BOOKS_ENDPOINT =
   "https://www.googleapis.com/books/v1/volumes";
 export const CATALOG_USER_AGENT = "tsundoku (contact@example.com)";
 
 /** Abort hung upstream requests after this many milliseconds. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 10_000;
+
+/** Maximum editions surfaced per provider for a title/author search. */
+export const DEFAULT_EDITION_LIMIT = 10;
 
 /** Raised when a catalog provider fails at the network/HTTP boundary. */
 export class CatalogError extends Error {
@@ -38,6 +53,14 @@ export interface CatalogClientOptions {
 export interface CatalogClient {
   /** Resolve a normalized ISBN-13 to an authoritative catalog record. */
   lookupByIsbn(isbn13: string): Promise<CatalogBook | null>;
+  /** Find candidate editions by title (and optional author) for the "Read Book Title" fallback. */
+  searchEditions(input: CatalogSearchInput): Promise<CatalogEdition[]>;
+}
+
+/** Title/author search input for the "Read Book Title" fallback. */
+export interface CatalogSearchInput {
+  title: string;
+  author?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -154,6 +177,95 @@ function parseGoogleBooks(isbn13: string, data: unknown): CatalogBook | null {
   return null;
 }
 
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+/**
+ * Choose the best ISBN-13 / ISBN-10 pair from a raw identifier list. A real
+ * ISBN-13 is preferred over one synthesized from an ISBN-10, and only
+ * Bookland-prefixed ISBN-13s survive `isValidIsbn13`.
+ */
+function pickIdentifiers(raw: readonly string[]): {
+  isbn13: string | null;
+  isbn10: string | null;
+} {
+  const normalized = raw.map((value) => normalizeIsbn(value)).filter((v) => v !== "");
+  const isbn10 = normalized.find((v) => isValidIsbn10(v)) ?? null;
+  const isbn13 =
+    normalized.find((v) => isValidIsbn13(v)) ??
+    (isbn10 ? isbn10ToIsbn13(isbn10) : null);
+  return { isbn13, isbn10 };
+}
+
+/** Map one Open Library `search.json` doc into a candidate edition, or `null`. */
+function parseOpenLibraryEdition(doc: Record<string, unknown>): CatalogEdition | null {
+  const title = isString(doc.title) ? doc.title : "";
+  if (title.trim() === "") return null;
+
+  const ids: string[] = [];
+  for (const key of ["isbn_13", "isbn_10", "isbn"]) {
+    const values = doc[key];
+    if (Array.isArray(values)) {
+      for (const value of values) if (isString(value)) ids.push(value);
+    }
+  }
+  const { isbn13, isbn10 } = pickIdentifiers(ids);
+  const publishers = Array.isArray(doc.publisher)
+    ? doc.publisher.filter(isString)
+    : [];
+  const year =
+    typeof doc.first_publish_year === "number"
+      ? Math.trunc(doc.first_publish_year)
+      : null;
+
+  return CatalogEditionSchema.parse({
+    title,
+    authors: Array.isArray(doc.author_name) ? doc.author_name.filter(isString) : [],
+    publisher: publishers[0] ?? null,
+    publishedYear: year,
+    isbn13,
+    isbn10,
+    source: "openlibrary",
+  });
+}
+
+/** Map one Google Books `volumeInfo` into a candidate edition, or `null`. */
+function parseGoogleBooksEdition(item: unknown): CatalogEdition | null {
+  const entry = asRecord(item);
+  const volume = entry ? asRecord(entry.volumeInfo) : null;
+  if (!volume) return null;
+
+  const title = isString(volume.title) ? volume.title : "";
+  if (title.trim() === "") return null;
+
+  const ids = Array.isArray(volume.industryIdentifiers)
+    ? volume.industryIdentifiers
+        .map((identifier) => asRecord(identifier))
+        .flatMap((identifier) =>
+          identifier && isString(identifier.identifier)
+            ? [identifier.identifier]
+            : [],
+        )
+    : [];
+  const { isbn13, isbn10 } = pickIdentifiers(ids);
+
+  return CatalogEditionSchema.parse({
+    title,
+    authors: Array.isArray(volume.authors) ? volume.authors.filter(isString) : [],
+    publisher: isString(volume.publisher) ? volume.publisher : null,
+    publishedYear: extractYear(volume.publishedDate),
+    isbn13,
+    isbn10,
+    source: "google-books",
+  });
+}
+
+/** Strip characters that would break a Google Books `intitle:`/`inauthor:` term. */
+function sanitizeQueryTerm(value: string): string {
+  return value.replace(/["\\]/g, " ").replace(/\s+/g, " ").trim();
+}
+
 /**
  * Create an injectable catalog client. The client never reads secrets itself;
  * the optional Google Books API key is passed in by the caller.
@@ -218,6 +330,95 @@ export function createCatalogClient(
     return parseGoogleBooks(isbn13, data);
   }
 
+  async function searchOpenLibrary(
+    input: CatalogSearchInput,
+  ): Promise<CatalogEdition[]> {
+    const params = new URLSearchParams();
+    params.set("title", input.title);
+    if (input.author) params.set("author", input.author);
+    params.set(
+      "fields",
+      "title,author_name,publisher,first_publish_year,isbn,isbn_13,isbn_10",
+    );
+    params.set("limit", String(DEFAULT_EDITION_LIMIT));
+    const url = `${OPEN_LIBRARY_SEARCH_ENDPOINT}?${params.toString()}`;
+    const data = await fetchJson(url, { "user-agent": CATALOG_USER_AGENT });
+    const root = asRecord(data);
+    const docs = root && Array.isArray(root.docs) ? root.docs : [];
+    return docs.flatMap((doc) => {
+      const record = asRecord(doc);
+      const edition = record ? parseOpenLibraryEdition(record) : null;
+      return edition ? [edition] : [];
+    });
+  }
+
+  /** Run a Google Books volumes query for `query` (an `intitle:`/plain term). */
+  async function searchGoogleBooks(query: string): Promise<CatalogEdition[]> {
+    const base = `${GOOGLE_BOOKS_ENDPOINT}?q=${encodeURIComponent(
+      query,
+    )}&maxResults=${DEFAULT_EDITION_LIMIT}`;
+    const url = googleBooksApiKey
+      ? `${base}&key=${encodeURIComponent(googleBooksApiKey)}`
+      : base;
+    let data: unknown;
+    try {
+      data = await fetchJson(url, { "user-agent": CATALOG_USER_AGENT });
+    } catch (error) {
+      if (error instanceof CatalogError && error.status === 429) {
+        return [];
+      }
+      throw error;
+    }
+    const root = asRecord(data);
+    const items = root && Array.isArray(root.items) ? root.items : [];
+    return items.flatMap((item) => {
+      const edition = parseGoogleBooksEdition(item);
+      return edition ? [edition] : [];
+    });
+  }
+
+  async function searchEditions(
+    input: CatalogSearchInput,
+  ): Promise<CatalogEdition[]> {
+    const title = input.title.trim();
+    if (title === "") return [];
+
+    let sawEmpty = false;
+    let sawError = false;
+
+    try {
+      const editions = await searchOpenLibrary({ title, author: input.author });
+      if (editions.length > 0) return editions;
+      sawEmpty = true;
+    } catch {
+      sawError = true;
+    }
+
+    // Google Books fallback: a precise `intitle:`/`inauthor:` query first, then
+    // a plain free-text `q=` search so hyphenated or punctuated titles still hit.
+    const term = sanitizeQueryTerm(title);
+    const author = input.author ? sanitizeQueryTerm(input.author) : "";
+    const refined = author
+      ? `intitle:${term} inauthor:${author}`
+      : `intitle:${term}`;
+    const plain = author ? `${term} ${author}` : term;
+
+    for (const query of [refined, plain]) {
+      if (query.trim() === "") continue;
+      try {
+        const editions = await searchGoogleBooks(query);
+        if (editions.length > 0) return editions;
+        sawEmpty = true;
+      } catch {
+        sawError = true;
+      }
+    }
+
+    if (sawEmpty) return [];
+    if (sawError) throw new CatalogError("All catalog providers failed");
+    return [];
+  }
+
   return {
     async lookupByIsbn(isbn13: string): Promise<CatalogBook | null> {
       let sawEmpty = false;
@@ -253,5 +454,6 @@ export function createCatalogClient(
       }
       return null;
     },
+    searchEditions,
   };
 }

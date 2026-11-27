@@ -1,6 +1,6 @@
 import type { APIRoute } from "astro";
 import { env } from "cloudflare:workers";
-import { BookLookupResultSchema } from "@repo/book-schemas";
+import { SaveableBookSchema } from "@repo/book-schemas";
 import { buildSheetRow, sheetRange, type SaveBookRequest } from "../../../lib/sheet-flow";
 import {
   createSheetsClient,
@@ -38,12 +38,12 @@ export const POST: APIRoute = async (context) => {
   }
 
   const envelope = payload as Partial<SaveBookRequest> | null;
-  const book = BookLookupResultSchema.safeParse(envelope?.book);
+  const book = SaveableBookSchema.safeParse(envelope?.book);
   if (!book.success) {
     return errorResponse(
       400,
       "INVALID_REQUEST",
-      "Provide a 'book' object matching the lookup result shape.",
+      "Provide a 'book' object with at least a non-empty 'title'.",
     );
   }
 

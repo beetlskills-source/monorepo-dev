@@ -48,6 +48,8 @@ const sampleRow = {
   default_visibility: "shared",
   sheet_visibility: "shared",
   allow_incoming_transfers: 1,
+  enrich_with_llm: 0,
+  has_llm_unlock: 0,
   google_refresh_token_encrypted: "v1.iv.ciphertext",
   updated_at: "2026-01-01T00:00:00.000Z",
 };
@@ -63,9 +65,23 @@ describe("getShelfConfig", () => {
       defaultVisibility: "shared",
       sheetVisibility: "shared",
       allowIncomingTransfers: true,
+      enrichWithLlm: false,
+      hasLlmUnlock: false,
       hasRefreshToken: true,
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
+  });
+
+  it("maps a stored LLM-enrichment preference of 1 to true", async () => {
+    const { db } = createFakeDb({ ...sampleRow, enrich_with_llm: 1 });
+    const config = await getShelfConfig(db, "user-1");
+    expect(config?.enrichWithLlm).toBe(true);
+  });
+
+  it("maps a stored $0.99 LLM unlock of 1 to true", async () => {
+    const { db } = createFakeDb({ ...sampleRow, has_llm_unlock: 1 });
+    const config = await getShelfConfig(db, "user-1");
+    expect(config?.hasLlmUnlock).toBe(true);
   });
 
   it("returns null when the user has no configuration", async () => {
@@ -118,6 +134,8 @@ describe("upsertShelfConfig", () => {
 
     expect(statements[0]?.sql).toContain("INSERT OR IGNORE INTO shelf_configs");
     expect(statements[0]?.sql).toContain("sheet_visibility");
+    // A new user starts on the free tier, so the unlock seeds to 0.
+    expect(statements[0]?.sql).toContain("has_llm_unlock");
     expect(statements[0]?.args).toContain(DEFAULT_SHEET_TAB_NAME);
     expect(statements[1]?.sql).toContain("UPDATE shelf_configs SET");
     expect(statements[1]?.sql).toContain("default_visibility = ?");
@@ -138,6 +156,17 @@ describe("upsertShelfConfig", () => {
     // the new-book default column, and vice versa.
     expect(statements[1]?.sql).not.toContain("default_visibility = ?");
     expect(statements[1]?.args).toContain("private");
+  });
+
+  it("persists the LLM-enrichment preference as a 0/1 integer", async () => {
+    const { db, statements } = createFakeDb(sampleRow);
+    await upsertShelfConfig(db, "user-1", { enrichWithLlm: true });
+
+    // The INSERT seeds the opt-in default (0) so an unset user is "No".
+    expect(statements[0]?.sql).toContain("enrich_with_llm");
+    expect(statements[1]?.sql).toContain("enrich_with_llm = ?");
+    // Booleans are written as integers, matching the D1 column type.
+    expect(statements[1]?.args).toContain(1);
   });
 
   it("stores an encrypted token without exporting it on the config", async () => {

@@ -37,5 +37,10 @@
 			"pattern": "tsundoku.singbaobao.com",
 			"custom_domain": true
 		}
-	]
+	],
+	"vars": {
+		"CREDIT_RATE_BOOK_SUMMARY": "0.00001",
+		"CREDIT_RATE_BATCH_BOOK_SUMMARY": "0.00010",
+		"CREDIT_RATE_BOOK_TITLE_IMAGE": "0.00005"
+	}	
 }

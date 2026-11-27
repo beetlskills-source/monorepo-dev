@@ -1,7 +1,11 @@
 ---
 export const prerender = false;
 
+import { env } from "cloudflare:workers";
+import { formatCredit } from "../lib/credits";
+import { LLM_UNLOCK_PRICE_USD } from "../lib/entitlements";
 import { GROUP_INVITE_QUERY_PARAM } from "../lib/groups";
+import { readShelfEntitlement } from "../lib/llm-entitlement";
 
 // Phase 5: an invite link (`/?invite=<token>`) must survive the sign-in
 // round-trip. Send signed-out visitors to `/login` with the token carried in
@@ -15,6 +19,25 @@ if (inviteToken) {
   }
   return Astro.redirect(`/login?next=${encodeURIComponent(next)}`);
 }
+
+// Resolve the caller's tier server-side so the UI gates exactly mirror the API:
+//   free-unregistered  -> anonymous, stateless (local/client state only)
+//   free-registered    -> signed in, D1-backed, no AI features
+//   paid-registered    -> signed in + one-time $0.99 LLM unlock (both AI features)
+const user = Astro.locals.user;
+const signedIn = Boolean(user);
+// Single-source entitlement read (shared with the API routes + webhook); it
+// fails closed to the locked defaults, so a not-yet-migrated deployment keeps
+// the scanner usable instead of crashing.
+const { enrichWithLlm, hasLlmUnlock, creditBalance } = user
+  ? await readShelfEntitlement(env.DB, user.id)
+  : { enrichWithLlm: false, hasLlmUnlock: false, creditBalance: 0 };
+
+const enrichHint = !signedIn
+  ? "Sign in to save this preference."
+  : !hasLlmUnlock
+    ? `Unlock AI features for $${LLM_UNLOCK_PRICE_USD} to enable LLM summaries.`
+    : "When on, each scan also asks the LLM for a summary — slower but richer. When off, only the fast catalog lookup runs.";
 ---
 
 <!doctype html>
@@ -26,16 +49,94 @@ if (inviteToken) {
     <title>Tsundoku — ISBN Scanner</title>
   </head>
   <body>
-    <main class="app">
-      <h1>ISBN Scanner</h1>
+    <main
+      class="app"
+      data-signed-in={signedIn ? "true" : "false"}
+      data-llm-unlock={hasLlmUnlock ? "true" : "false"}
+      data-credit-balance={String(creditBalance)}
+      data-unlock-price={String(LLM_UNLOCK_PRICE_USD)}
+    >
+      <h1 id="page-heading">ISBN Scanner</h1>
       <p class="subtitle">
-        Scan a book barcode with your camera, or type an ISBN-10 / ISBN-13 below.
+        Scan a book barcode with your camera, type an ISBN-10 / ISBN-13, or read
+        a title off a cover — then save it to your shelf.
       </p>
 
       <p class="nav"><a href="/dashboard">Dashboard →</a></p>
 
-      <section class="panel" aria-label="Camera scanner">
+      <section class="panel" aria-label="Scan mode">
+        <fieldset id="mode-setting" class="mode-setting">
+          <legend>Mode</legend>
+          <label>
+            <input type="radio" name="scanMode" value="isbn" checked />
+            Scan ISBN
+          </label>
+          <label>
+            <input type="radio" name="scanMode" value="title" />
+            Enter Book Title
+          </label>
+          <label>
+            <input type="radio" name="scanMode" value="cover" />
+            Read Cover with AI
+          </label>
+        </fieldset>
+        <p id="mode-hint" class="hint">
+          Scan ISBN is the fastest, most accurate path — it resolves the exact
+          edition from the barcode.
+        </p>
+        <fieldset
+          id="enrich-setting"
+          class="enrich-setting"
+          data-enrich-setting
+          disabled={!signedIn || !hasLlmUnlock}
+        >
+          <legend>Enrich book info with LLM</legend>
+          <label>
+            <input
+              type="radio"
+              name="enrichWithLlm"
+              value="yes"
+              checked={enrichWithLlm}
+            />
+            Yes
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="enrichWithLlm"
+              value="no"
+              checked={!enrichWithLlm}
+            />
+            No
+          </label>
+        </fieldset>
+        <p id="enrich-hint" class="hint">{enrichHint}</p>
+        <p id="enrich-status" class="status" role="status" hidden></p>
+        <p id="ai-signin" class="hint" hidden>
+          <a href="/login?next=%2F">Sign in</a> to use AI features.
+        </p>
+        <div id="unlock-row" class="controls" hidden>
+          <button id="unlock-ai" type="button">
+            Unlock AI features for {LLM_UNLOCK_PRICE_USD}
+          </button>
+        </div>
+        <p
+          id="payment-success"
+          class="status"
+          role="status"
+          data-tone="success"
+          hidden
+        >
+          Payment of ${LLM_UNLOCK_PRICE_USD} is successful. AI credit remaining:{" "}
+          <strong id="payment-balance">{formatCredit(creditBalance)}</strong>.
+        </p>
+      </section>
+
+      <section id="camera-panel" class="panel" aria-label="Camera scanner">
         <video id="preview" playsinline muted></video>
+        <p id="status-isbn" class="status" role="status" data-tone="info">
+          Starting the camera… point it at a book's ISBN barcode.
+        </p>
         <div id="warning" class="warning" role="alert" hidden>
           <p class="warning-text">
             Scanner stalled or couldn't lock onto the barcode. Hold the ISBN
@@ -43,46 +144,103 @@ if (inviteToken) {
           </p>
           <button id="restart" type="button">Restart Camera</button>
         </div>
-        <div class="controls">
-          <button id="start" type="button">Start camera</button>
-          <button id="stop" type="button" disabled>Stop</button>
-          <button id="scan" type="button" disabled>Scan frame</button>
+        <div id="camera-error" class="warning" role="alert" hidden>
+          <p id="camera-error-text" class="warning-text">
+            The camera could not be started.
+          </p>
+          <button id="camera-retry" type="button">Retry Camera</button>
         </div>
       </section>
 
-      <section class="panel" aria-label="Manual ISBN entry">
-        <form id="manual-form" autocomplete="off">
-          <label for="isbn-input">Manual ISBN</label>
+      <div id="isbn-panel">
+        <section class="panel" aria-label="Manual ISBN entry">
+          <form id="manual-form" autocomplete="off">
+            <label for="isbn-input">Manual ISBN</label>
+            <div class="controls">
+              <input
+                id="isbn-input"
+                class="field-input"
+                name="isbn"
+                type="text"
+                inputmode="numeric"
+                placeholder="9780306406157"
+              />
+              <button id="lookup" class="field-button" type="submit">Look up</button>
+            </div>
+          </form>
+        </section>
+        <section id="result-isbn" class="result" aria-live="polite" hidden></section>
+      </div>
+
+      <section id="title-panel" class="panel" aria-label="Enter Book Title" hidden>
+        <p id="status-title" class="status" role="status" data-tone="info">
+          Enter a title (and optional author), then tap Search.
+        </p>
+        <p class="hint">
+          No barcode? Type the title (and optional author) and search the online
+          catalogs.
+        </p>
+        <form id="title-form" autocomplete="off">
+          <label for="title-input">Title</label>
+          <input id="title-input" name="title" type="text" placeholder="Book title" />
+          <label for="title-author">Author (optional)</label>
+          <input id="title-author" name="author" type="text" placeholder="Author" />
           <div class="controls">
-            <input
-              id="isbn-input"
-              name="isbn"
-              type="text"
-              inputmode="numeric"
-              placeholder="9780306406157"
-            />
-            <button id="lookup" type="submit">Look up</button>
+            <button id="title-search" type="submit">Search</button>
+            <button id="title-save" type="button">Just Save It</button>
           </div>
         </form>
+        <section id="result-title" class="result" aria-live="polite" hidden></section>
+        <section id="title-candidates" aria-label="All Possible Book Titles" hidden>
+          <h3 class="candidates-heading">All Possible Book Titles</h3>
+          <p class="hint">Edit a row and tap Select to use that book instead.</p>
+          <div id="title-candidate-list" class="candidate-list"></div>
+        </section>
       </section>
 
-      <p id="status" class="status" role="status" data-tone="info">
-        Start the camera or enter an ISBN to begin.
-      </p>
-
-      <section id="result" class="result" aria-live="polite" hidden></section>
+      <section id="cover-panel" class="panel" aria-label="Read Cover with AI" hidden>
+        <p class="hint">
+          Point the camera at the book cover, then tap Capture. The cover is
+          read once, then verified against Open Library / Google Books. The live
+          camera keeps running so you can capture again.
+        </p>
+        <video id="cover-video" playsinline muted></video>
+        <p id="status-cover" class="status" role="status" data-tone="info">
+          Point the camera at the cover, then tap Capture.
+        </p>
+        <canvas id="cover-canvas" hidden></canvas>
+        <!-- Fallback only: used when the live camera is unavailable. -->
+        <input id="cover-file" type="file" accept="image/*" hidden />
+        <div class="controls">
+          <button id="cover-capture" type="button">Capture</button>
+        </div>
+        <section id="result-cover" class="result" aria-live="polite" hidden></section>
+        <section id="cover-candidates" aria-label="All Possible Book Titles" hidden>
+          <h3 class="candidates-heading">All Possible Book Titles</h3>
+          <p class="hint">Edit a row and tap Select to use that book instead.</p>
+          <div id="cover-candidate-list" class="candidate-list"></div>
+        </section>
+      </section>
     </main>
 
     <script>
       import {
         BookLookupResultSchema,
-        type BookLookupResult,
+        CoverLookupResponseSchema,
+        TitleLookupResponseSchema,
+        type CatalogEdition,
+        type CoverLookupResponse,
+        type SaveableBook,
       } from "@repo/book-schemas";
+      import { addLocalShelfBook } from "../lib/local-shelf";
+      import {
+        buildManualBook,
+        createLocalBookId,
+        MANUAL_ID_PREFIX,
+      } from "../lib/manual-book";
       import {
         extractIsbnCandidates,
-        isDuplicateScan,
         isVideoStalled,
-        type RecentScan,
         type VideoHealthSample,
       } from "../lib/scanner";
 
@@ -92,6 +250,10 @@ if (inviteToken) {
       const RESTART_DELAY_MS = 300;
       /** How often the health watchdog samples the video element. */
       const WATCHDOG_INTERVAL_MS = 1000;
+      /** Longest edge (px) a cover is down-scaled to before the AI upload. */
+      const COVER_MAX_EDGE = 1024;
+      /** JPEG quality for the compressed cover upload. */
+      const COVER_JPEG_QUALITY = 0.8;
 
       interface DetectedBarcode {
         rawValue: string;
@@ -105,29 +267,142 @@ if (inviteToken) {
         formats: string[];
       }) => BarcodeDetectorLike;
 
+      const appEl = document.querySelector(".app") as HTMLElement | null;
+      /** The resolved entitlement, mirrored from the server-rendered attributes. */
+      let signedIn = appEl?.dataset.signedIn === "true";
+      let creditBalance = Number(appEl?.dataset.creditBalance ?? "0") || 0;
+      // AI access is credit-derived: a positive balance unlocks both AI features.
+      let llmUnlocked = appEl?.dataset.llmUnlock === "true" || creditBalance > 0;
+      const unlockPrice = appEl?.dataset.unlockPrice ?? "0.99";
+      /** Format a USD amount with at least two decimals (e.g. `$0.99`). */
+      function formatCredit(value: number): string {
+        return `$${Math.max(0, value).toFixed(2)}`;
+      }
+
       const videoEl = document.getElementById("preview") as HTMLVideoElement | null;
-      const startButton = document.getElementById("start") as HTMLButtonElement | null;
-      const stopButton = document.getElementById("stop") as HTMLButtonElement | null;
-      const scanButton = document.getElementById("scan") as HTMLButtonElement | null;
       const form = document.getElementById("manual-form") as HTMLFormElement | null;
       const input = document.getElementById("isbn-input") as HTMLInputElement | null;
       const lookupButton = document.getElementById("lookup") as HTMLButtonElement | null;
-      const statusEl = document.getElementById("status") as HTMLParagraphElement | null;
-      const resultEl = document.getElementById("result") as HTMLElement | null;
       const warningEl = document.getElementById("warning") as HTMLDivElement | null;
       const restartButton = document.getElementById("restart") as HTMLButtonElement | null;
+      const cameraErrorEl = document.getElementById("camera-error") as HTMLDivElement | null;
+      const cameraErrorText = document.getElementById("camera-error-text") as HTMLParagraphElement | null;
+      const cameraRetryButton = document.getElementById("camera-retry") as HTMLButtonElement | null;
+      const enrichSetting = document.getElementById("enrich-setting") as HTMLFieldSetElement | null;
+      const enrichHint = document.getElementById("enrich-hint") as HTMLParagraphElement | null;
+      const enrichStatus = document.getElementById("enrich-status") as HTMLParagraphElement | null;
+
+      const modeSetting = document.getElementById("mode-setting") as HTMLFieldSetElement | null;
+      const modeHint = document.getElementById("mode-hint") as HTMLParagraphElement | null;
+      const pageHeading = document.getElementById("page-heading") as HTMLHeadingElement | null;
+      const cameraPanel = document.getElementById("camera-panel") as HTMLElement | null;
+      const isbnPanel = document.getElementById("isbn-panel") as HTMLElement | null;
+      const titlePanel = document.getElementById("title-panel") as HTMLElement | null;
+      const coverPanel = document.getElementById("cover-panel") as HTMLElement | null;
+      const coverFileInput = document.getElementById("cover-file") as HTMLInputElement | null;
+      const coverVideoEl = document.getElementById("cover-video") as HTMLVideoElement | null;
+      const coverCanvasEl = document.getElementById("cover-canvas") as HTMLCanvasElement | null;
+      const coverCaptureButton = document.getElementById("cover-capture") as HTMLButtonElement | null;
+      const coverCandidatesEl = document.getElementById("cover-candidates") as HTMLElement | null;
+      const coverCandidateListEl = document.getElementById("cover-candidate-list") as HTMLElement | null;
+      const titleCandidatesEl = document.getElementById("title-candidates") as HTMLElement | null;
+      const titleCandidateListEl = document.getElementById("title-candidate-list") as HTMLElement | null;
+      const aiSigninEl = document.getElementById("ai-signin") as HTMLParagraphElement | null;
+      const unlockRow = document.getElementById("unlock-row") as HTMLElement | null;
+      const unlockButton = document.getElementById("unlock-ai") as HTMLButtonElement | null;
+      const paymentSuccess = document.getElementById("payment-success") as HTMLElement | null;
+      const paymentBalance = document.getElementById("payment-balance") as HTMLElement | null;
+      const titleForm = document.getElementById("title-form") as HTMLFormElement | null;
+      const titleInput = document.getElementById("title-input") as HTMLInputElement | null;
+      const titleAuthorInput = document.getElementById("title-author") as HTMLInputElement | null;
+      const titleSearchButton = document.getElementById("title-search") as HTMLButtonElement | null;
+      const titleSaveButton = document.getElementById("title-save") as HTMLButtonElement | null;
+
+      /** The three scanner modes, each owning an independent result state. */
+      type Mode = "isbn" | "title" | "cover";
+      /** Each mode renders into its own "Match found" container, so switching
+       *  modes shows only the active mode's card without discarding the rest. */
+      const resultEls: Record<Mode, HTMLElement | null> = {
+        isbn: document.getElementById("result-isbn"),
+        title: document.getElementById("result-title"),
+        cover: document.getElementById("result-cover"),
+      };
+      /** Each mode owns its own instructional/status bar, positioned in-panel. */
+      const statusEls: Record<Mode, HTMLElement | null> = {
+        isbn: document.getElementById("status-isbn"),
+        title: document.getElementById("status-title"),
+        cover: document.getElementById("status-cover"),
+      };
+
+      /** The "Possible Book Titles" list backing one mode (cover / title). */
+      interface CandidatesPanel {
+        mode: Mode;
+        section: HTMLElement | null;
+        list: HTMLElement | null;
+      }
+      const coverCandidates: CandidatesPanel = {
+        mode: "cover",
+        section: coverCandidatesEl,
+        list: coverCandidateListEl,
+      };
+      const titleCandidates: CandidatesPanel = {
+        mode: "title",
+        section: titleCandidatesEl,
+        list: titleCandidateListEl,
+      };
 
       let mediaStream: MediaStream | null = null;
+      /** Live stream for the inline "Read Cover with AI" camera. */
+      let coverStream: MediaStream | null = null;
       let barcodeDetector: BarcodeDetectorLike | null = null;
-      let scanning = false;
       let videoTrack: MediaStreamTrack | null = null;
-      let recentScan: RecentScan | null = null;
-      let scanStartedAt: number | null = null;
       let watchdogTimer: number | null = null;
       let lastVideoSample: VideoHealthSample | null = null;
       let stalledSince: number | null = null;
+      /** The continuous ISBN barcode loop runs while `Scan ISBN` is active. */
+      let scanLoopEnabled = false;
+      /** Guards against two overlapping scan loops (e.g. rapid mode toggles). */
+      let scanLoopRunning = false;
+      /** Last barcode pushed into "Manual ISBN", so the same code is not re-filled. */
+      let lastScannedIsbn: string | null = null;
+      /** Last ISBN submitted with "Look up"; drives the button's green highlight. */
+      let lastLookedUpIsbn: string | null = null;
+      /** Active scanner mode; `Scan ISBN` is the fast default. */
+      let currentMode: Mode = "isbn";
 
+      /** Nudge the sign-in / $0.99-unlock / credit prompts to match the tier. */
+      function syncAiGates(): void {
+        if (aiSigninEl) aiSigninEl.hidden = signedIn;
+        // The "$0.99 unlock" prompt is shown only while the user has no AI
+        // credit; once any credit remains it is hidden. The success banner is
+        // deliberately *not* tied to this state: it is an ephemeral, one-time
+        // message shown only by the live top-up confirmation (see
+        // `showPaymentSuccess`), never re-shown on a plain reload.
+        if (unlockRow) unlockRow.hidden = !signedIn || creditBalance > 0;
+        if (enrichHint) {
+          enrichHint.textContent = !signedIn
+            ? "Sign in to save this preference."
+            : !llmUnlocked
+              ? `Unlock AI features for $${unlockPrice} to enable LLM summaries.`
+              : "When on, each scan also asks the LLM for a summary — slower but richer. When off, only the fast catalog lookup runs.";
+        }
+      }
+
+      /**
+       * Surface the one-time "$0.99 top-up successful" banner. Only ever called
+       * from the live top-up confirmation paths (HitPay return → reconcile /
+       * balance poll), so the message is ephemeral and is never re-shown on a
+       * page reload.
+       */
+      function showPaymentSuccess(balance: number): void {
+        if (!paymentSuccess) return;
+        if (paymentBalance) paymentBalance.textContent = formatCredit(balance);
+        paymentSuccess.hidden = false;
+      }
+
+      /** Write a message to the active mode's own in-panel status bar. */
       function setStatus(message: string, tone?: string): void {
+        const statusEl = statusEls[currentMode];
         if (!statusEl) return;
         statusEl.textContent = message;
         statusEl.dataset.tone = tone || "info";
@@ -139,12 +414,60 @@ if (inviteToken) {
         if (input) input.disabled = isLoading;
       }
 
+      /** Hide one mode's "Match found" card while a new lookup/scan is in flight. */
+      function clearResult(mode: Mode): void {
+        const el = resultEls[mode];
+        if (el) el.hidden = true;
+      }
+
+      /** Toggle the "Enter Book Title" form's busy state. */
+      function setTitleBusy(isBusy: boolean): void {
+        for (const control of [
+          titleInput,
+          titleAuthorInput,
+          titleSearchButton,
+          titleSaveButton,
+        ]) {
+          if (control) control.disabled = isBusy;
+        }
+      }
+
       function showWarning(): void {
         if (warningEl) warningEl.hidden = false;
       }
 
       function hideWarning(): void {
         if (warningEl) warningEl.hidden = true;
+      }
+
+      /** Surface a camera permission/startup failure with a Retry action. */
+      function showCameraError(message: string): void {
+        if (cameraErrorText) {
+          cameraErrorText.textContent = `${message} Check the camera permission, then tap Retry Camera.`;
+        }
+        if (cameraErrorEl) cameraErrorEl.hidden = false;
+      }
+
+      function hideCameraError(): void {
+        if (cameraErrorEl) cameraErrorEl.hidden = true;
+      }
+
+      /**
+       * Toggle the "Look up" button's green highlight. It stays green while the
+       * "Manual ISBN" input holds a non-empty value that differs from the last
+       * submitted one — whether that value arrived from a scanned barcode or
+       * manual typing — and reverts to the default colour once submitted.
+       */
+      function updateLookupHighlight(): void {
+        if (!lookupButton) return;
+        const value = input ? input.value.trim() : "";
+        const highlight = value !== "" && value !== lastLookedUpIsbn;
+        lookupButton.classList.toggle("highlight", highlight);
+      }
+
+      /** Promise-based sleep, used to pace the continuous scan loop. */
+      function delay(ms: number): Promise<void> {
+        return new Promise((resolve) => window.setTimeout(resolve, ms));
       }
 
       /** Release the current stream and detach track listeners. */
@@ -185,12 +508,8 @@ if (inviteToken) {
 
         const videoFrozen =
           stalledSince !== null && now - stalledSince >= STALL_WARNING_MS;
-        const scanStuck =
-          scanning &&
-          scanStartedAt !== null &&
-          now - scanStartedAt >= STALL_WARNING_MS;
 
-        if (videoFrozen || scanStuck) {
+        if (videoFrozen) {
           showWarning();
         } else {
           hideWarning();
@@ -231,19 +550,51 @@ if (inviteToken) {
         };
       }
 
-      function renderResult(book: BookLookupResult): void {
+      /** A user-facing message from an API error body, or a fallback. */
+      function errorMessage(data: unknown, fallback: string): string {
+        return data !== null &&
+          typeof data === "object" &&
+          typeof (data as { message?: unknown }).message === "string"
+          ? (data as { message: string }).message
+          : fallback;
+      }
+
+      /** Human-readable provenance line for the read-only match card. */
+      function describeProvenance(book: SaveableBook): string {
+        const source = book.source === "manual" ? "manual entry" : book.source;
+        return `Source: ${source} · ${
+          book.verified ? "verified" : "not verified"
+        } · ${book.enriched ? "enriched" : "not enriched"} · Confidence: ${
+          book.confidence
+        }`;
+      }
+
+      /**
+       * Render the "Match found" result as a **read-only** card into the given
+       * mode's container. The heading stays a plain "Match found" (the state is
+       * still scoped per mode by rendering into that mode's own container).
+       * Users who want to edit the fields switch to another mode, so the match
+       * itself is never editable here.
+       */
+      function renderResult(mode: Mode, book: SaveableBook): void {
+        const resultEl = resultEls[mode];
         if (!resultEl) return;
         resultEl.hidden = false;
         resultEl.replaceChildren();
 
-        const title = document.createElement("h2");
-        title.textContent = book.title;
-        resultEl.appendChild(title);
+        const heading = document.createElement("h2");
+        heading.textContent = "Match found";
+        resultEl.appendChild(heading);
+
+        const titleEl = document.createElement("p");
+        titleEl.className = "match-title";
+        titleEl.textContent = book.title;
+        resultEl.appendChild(titleEl);
 
         if (book.authors.length > 0) {
-          const authors = document.createElement("p");
-          authors.textContent = `by ${book.authors.join(", ")}`;
-          resultEl.appendChild(authors);
+          const authorsEl = document.createElement("p");
+          authorsEl.textContent = book.authors.join(", ");
+          resultEl.appendChild(authorsEl);
         }
 
         const meta: string[] = [];
@@ -261,34 +612,296 @@ if (inviteToken) {
           resultEl.appendChild(summaryEl);
         }
 
-        const isbnEl = document.createElement("p");
-        isbnEl.textContent = `ISBN-13: ${book.isbn13}`;
-        resultEl.appendChild(isbnEl);
+        // A synthetic `manual:` id is not a real ISBN, so it is not shown.
+        if (!book.isbn13.startsWith(MANUAL_ID_PREFIX)) {
+          const isbnEl = document.createElement("p");
+          isbnEl.textContent = `ISBN-13: ${book.isbn13}`;
+          resultEl.appendChild(isbnEl);
+        }
 
         const provenanceEl = document.createElement("p");
-        provenanceEl.textContent = `Source: ${book.source} · ${
-          book.verified ? "verified" : "unverified"
-        } · ${book.enriched ? "enriched" : "not enriched"} · Confidence: ${
-          book.confidence
-        }`;
+        provenanceEl.textContent = describeProvenance(book);
         resultEl.appendChild(provenanceEl);
 
         const saveButton = document.createElement("button");
         saveButton.type = "button";
         saveButton.id = "save-to-shelf";
-        saveButton.textContent = "Save to my shelf";
+        saveButton.className = "field-button action-button";
+        saveButton.textContent = signedIn
+          ? "Save to my shelf"
+          : "Save on this device";
         saveButton.addEventListener("click", () => {
-          void saveToShelf(book, saveButton);
+          void persistBook(book, saveButton);
         });
         resultEl.appendChild(saveButton);
       }
 
-      /** Persist a looked-up book into the signed-in user's personal sheet. */
-      async function saveToShelf(
-        book: BookLookupResult,
+      /**
+       * Map a single-pass cover result into the shelf-writable shape. A catalog
+       * match becomes a verified book (provider as `source`); a vision-only read
+       * falls back to a user-confirmed manual entry.
+       */
+      function coverResponseToSaveable(data: CoverLookupResponse): SaveableBook {
+        if (data.source !== "catalog_lookup" || data.provider === null) {
+          return buildManualBook({
+            title: data.title,
+            authors: data.authors,
+            publisher: data.publisher,
+            publishedYear: data.publishedYear,
+            isbn13: data.isbn,
+          });
+        }
+        return {
+          isbn13:
+            data.isbn ?? createLocalBookId(data.title, data.authors.join(", ")),
+          title: data.title,
+          authors: data.authors,
+          publisher: data.publisher,
+          publishedYear: data.publishedYear,
+          summary: data.summary,
+          source: data.provider,
+          verified: true,
+          enriched: data.enriched,
+          confidence: data.confidence,
+        };
+      }
+
+      /** Render a completed cover read directly into the read-only "Match found". */
+      function renderCoverMatch(data: CoverLookupResponse): void {
+        renderResult("cover", coverResponseToSaveable(data));
+        if (data.source === "catalog_lookup") {
+          setStatus(
+            "Match found — verified against Open Library / Google Books.",
+            "success",
+          );
+          return;
+        }
+        setStatus(
+          `Read “${data.title}” from the cover but found no catalog match. Save it as-is, or retake the photo.`,
+          "warning",
+        );
+      }
+
+      /** Message shown when a "Possible Book Titles" row resolves to nothing. */
+      const COMBINATION_ERROR =
+        "That is not a valid combination. Check the combination and try again.";
+
+      /** The editable inputs backing one "Possible Book Titles" row. */
+      interface CandidateRow {
+        title: HTMLInputElement;
+        author: HTMLInputElement;
+        isbn: HTMLInputElement;
+      }
+
+      /** Clear one mode's "Possible Book Titles" list. */
+      function clearCandidates(panel: CandidatesPanel): void {
+        if (panel.list) panel.list.replaceChildren();
+        if (panel.section) panel.section.hidden = true;
+      }
+
+      /**
+       * Populate a mode's "Possible Book Titles" with the catalog candidate
+       * editions returned for a title/ISBN hint. When the catalog resolved
+       * nothing, the raw hint is offered as a single row the user can edit and
+       * select. Shared by "Read Cover with AI" and "Enter Book Title".
+       */
+      function renderCandidates(
+        panel: CandidatesPanel,
+        editions: readonly CatalogEdition[],
+        hint: { title: string; author: string },
+      ): void {
+        if (!panel.list || !panel.section) return;
+        panel.list.replaceChildren();
+
+        const rows = editions.map((edition) => ({
+          title: edition.title,
+          author: edition.authors.join(", "),
+          isbn: edition.isbn13 ?? edition.isbn10 ?? "",
+        }));
+        // No catalog candidates: seed a single row from the raw hint.
+        if (rows.length === 0 && hint.title.trim() !== "") {
+          rows.push({ title: hint.title, author: hint.author, isbn: "" });
+        }
+        if (rows.length === 0) {
+          panel.section.hidden = true;
+          return;
+        }
+
+        for (const row of rows) {
+          panel.list.appendChild(buildCandidateRow(panel.mode, row));
+        }
+        panel.section.hidden = false;
+      }
+
+      /** Build one editable candidate row (Title / Author / ISBN + Select). */
+      function buildCandidateRow(
+        mode: Mode,
+        values: { title: string; author: string; isbn: string },
+      ): HTMLElement {
+        const container = document.createElement("div");
+        container.className = "candidate";
+
+        const titleInput = document.createElement("input");
+        titleInput.className = "field-input";
+        titleInput.type = "text";
+        titleInput.placeholder = "Title";
+        titleInput.value = values.title;
+
+        const authorInput = document.createElement("input");
+        authorInput.className = "field-input";
+        authorInput.type = "text";
+        authorInput.placeholder = "Author (optional)";
+        authorInput.value = values.author;
+
+        const isbnInput = document.createElement("input");
+        isbnInput.className = "field-input";
+        isbnInput.type = "text";
+        isbnInput.inputMode = "numeric";
+        isbnInput.placeholder = "ISBN (optional)";
+        isbnInput.value = values.isbn;
+
+        const selectButton = document.createElement("button");
+        selectButton.type = "button";
+        selectButton.className = "field-button action-button";
+        selectButton.textContent = "Select";
+
+        const row: CandidateRow = {
+          title: titleInput,
+          author: authorInput,
+          isbn: isbnInput,
+        };
+        selectButton.addEventListener("click", () => {
+          void selectCandidateRow(mode, row);
+        });
+
+        for (const control of [titleInput, authorInput, isbnInput, selectButton]) {
+          container.appendChild(control);
+        }
+        return container;
+      }
+
+      /**
+       * Resolve a candidate ISBN through the canonical `/api/isbn-lookup`
+       * pipeline (which also applies the caller's LLM-enrichment preference
+       * server-side) and render it into the calling mode's "Match found".
+       * Returns `true` when a match was rendered.
+       */
+      async function resolveCandidateIsbn(mode: Mode, isbn: string): Promise<boolean> {
+        const [candidate] = extractIsbnCandidates(isbn);
+        if (!candidate) return false;
+        setStatus(`Looking up ${candidate}…`, "info");
+        let response: Response;
+        try {
+          response = await fetch("/api/isbn-lookup", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ isbn: candidate }),
+          });
+        } catch {
+          return false;
+        }
+        const data: unknown = await response.json().catch(() => null);
+        if (!response.ok) return false;
+        const parsed = BookLookupResultSchema.safeParse(data);
+        if (!parsed.success) return false;
+        renderResult(mode, parsed.data);
+        setStatus("Match found.", "success");
+        return true;
+      }
+
+      /** Fetch candidate editions for a title (+ optional author) search. */
+      async function fetchTitleEditions(
+        title: string,
+        author: string,
+      ): Promise<CatalogEdition[]> {
+        let response: Response;
+        try {
+          response = await fetch("/api/title-lookup", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(author ? { title, author } : { title }),
+          });
+        } catch {
+          return [];
+        }
+        const data: unknown = await response.json().catch(() => null);
+        if (!response.ok) return [];
+        const parsed = TitleLookupResponseSchema.safeParse(data);
+        return parsed.success ? parsed.data.editions : [];
+      }
+
+      /**
+       * Resolve a "Possible Book Titles" row on **Select**: a provided ISBN wins
+       * (canonical lookup + enrichment), otherwise a Title/Author catalog
+       * search. A no-match or empty/invalid combination surfaces an ephemeral
+       * "invalid combination" message; otherwise the calling mode's read-only
+       * "Match found" card is updated with the canonical metadata.
+       */
+      async function selectCandidateRow(
+        mode: Mode,
+        row: CandidateRow,
+      ): Promise<void> {
+        clearResult(mode);
+        const rawIsbn = row.isbn.value.trim();
+        if (rawIsbn !== "") {
+          const ok = await resolveCandidateIsbn(mode, rawIsbn);
+          if (!ok) setStatus(COMBINATION_ERROR, "warning");
+          return;
+        }
+
+        const title = row.title.value.trim();
+        const author = row.author.value.trim();
+        if (title === "") {
+          setStatus(COMBINATION_ERROR, "warning");
+          return;
+        }
+
+        setStatus("Searching Open Library and Google Books…", "info");
+        const editions = await fetchTitleEditions(title, author);
+        const best = editions[0];
+        if (!best) {
+          setStatus(COMBINATION_ERROR, "warning");
+          return;
+        }
+        // Prefer a canonical ISBN lookup (which also applies enrichment) when
+        // the best edition carries an identifier; otherwise render it directly.
+        const isbn = best.isbn13 ?? best.isbn10 ?? "";
+        if (isbn !== "" && (await resolveCandidateIsbn(mode, isbn))) return;
+
+        renderResult(mode, editionToSaveable(best));
+        setStatus("Match found in the catalog.", "success");
+      }
+
+      /**
+       * Persist a looked-up or manually-entered book. Registered tiers (Free
+       * and Paid) save through D1/Sheets; a Free-Unregistered visitor stays
+       * stateless and saves to `localStorage` only.
+       */
+      async function persistBook(
+        book: SaveableBook,
         button: HTMLButtonElement,
       ): Promise<void> {
         button.disabled = true;
+
+        if (!signedIn) {
+          try {
+            const entries = addLocalShelfBook(
+              window.localStorage,
+              book,
+              new Date().toISOString(),
+            );
+            setStatus(
+              `Saved on this device (${entries.length} book${entries.length === 1 ? "" : "s"}). Sign in to sync to a Google Sheet.`,
+              "success",
+            );
+            button.textContent = "Saved";
+          } catch {
+            setStatus("Could not save on this device.", "error");
+            button.disabled = false;
+          }
+          return;
+        }
+
         setStatus("Saving to your shelf…", "info");
 
         let response: Response;
@@ -304,20 +917,10 @@ if (inviteToken) {
           return;
         }
 
-        let data: unknown = null;
-        try {
-          data = await response.json();
-        } catch {
-          data = null;
-        }
+        const data: unknown = await response.json().catch(() => null);
 
         if (!response.ok) {
-          const message =
-            data !== null &&
-            typeof data === "object" &&
-            typeof (data as { message?: unknown }).message === "string"
-              ? (data as { message: string }).message
-              : "Could not save this book.";
+          const message = errorMessage(data, "Could not save this book.");
           const hint =
             response.status === 401 || response.status === 409
               ? " Open your dashboard to sign in or connect a Google Sheet."
@@ -333,28 +936,29 @@ if (inviteToken) {
 
       async function startCamera(): Promise<void> {
         if (!videoEl) return;
+        hideCameraError();
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          setStatus(
-            "Camera is unavailable in this browser. Enter an ISBN manually.",
-            "warning",
-          );
+          showCameraError("The camera is unavailable in this browser.");
           return;
         }
 
         try {
           mediaStream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: "environment" },
+            // `ideal` keeps desktops (no rear lens) working instead of failing.
+            video: { facingMode: { ideal: "environment" } },
+            audio: false,
           });
-        } catch {
-          setStatus(
-            "Camera permission denied. Enter an ISBN manually.",
-            "warning",
-          );
+        } catch (error) {
+          showCameraError(describeCameraError(error));
           return;
         }
 
         videoEl.srcObject = mediaStream;
-        await videoEl.play();
+        try {
+          await videoEl.play();
+        } catch {
+          // Some browsers need a gesture before playback; the frame still shows.
+        }
 
         const Detector = (
           window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }
@@ -369,43 +973,33 @@ if (inviteToken) {
           }
         }
 
-        scanning = false;
-        scanStartedAt = null;
-        recentScan = null;
+        lastScannedIsbn = null;
         attachTrackListeners(mediaStream);
         startWatchdog();
         hideWarning();
-
-        if (startButton) startButton.disabled = true;
-        if (stopButton) stopButton.disabled = false;
-        if (scanButton) scanButton.disabled = false;
-        setStatus("Camera ready. Aim at the barcode and scan.", "info");
+        updateLookupHighlight();
+        setStatus("Camera ready. Point it at the ISBN barcode.", "info");
+        startScanLoop();
       }
 
       function stopCamera(): void {
+        stopScanLoop();
         stopWatchdog();
         hideWarning();
+        hideCameraError();
         releaseStream();
-        scanning = false;
-        scanStartedAt = null;
-        if (startButton) startButton.disabled = false;
-        if (stopButton) stopButton.disabled = true;
-        if (scanButton) scanButton.disabled = true;
-        setStatus("Camera stopped.", "info");
       }
 
       /** Stop the current stream, wait briefly, then re-acquire the camera. */
       async function restartCamera(): Promise<void> {
         if (restartButton) restartButton.disabled = true;
+        if (cameraRetryButton) cameraRetryButton.disabled = true;
         setStatus("Restarting camera…", "info");
-        stopWatchdog();
-        hideWarning();
-        releaseStream();
-        scanning = false;
-        scanStartedAt = null;
-        await new Promise((resolve) => window.setTimeout(resolve, RESTART_DELAY_MS));
+        stopCamera();
+        await delay(RESTART_DELAY_MS);
         await startCamera();
         if (restartButton) restartButton.disabled = false;
+        if (cameraRetryButton) cameraRetryButton.disabled = false;
       }
 
       async function detectBarcodeText(): Promise<string> {
@@ -425,6 +1019,7 @@ if (inviteToken) {
       }
 
       async function lookup(rawIsbn: string): Promise<void> {
+        clearResult("isbn");
         const [candidate] = extractIsbnCandidates(rawIsbn);
         if (!candidate) {
           setStatus(
@@ -453,21 +1048,10 @@ if (inviteToken) {
             return;
           }
 
-          let data: unknown = null;
-          try {
-            data = await response.json();
-          } catch {
-            data = null;
-          }
+          const data: unknown = await response.json().catch(() => null);
 
           if (!response.ok) {
-            const message =
-              data !== null &&
-              typeof data === "object" &&
-              typeof (data as { message?: unknown }).message === "string"
-                ? (data as { message: string }).message
-                : "The lookup failed.";
-            setStatus(message, "error");
+            setStatus(errorMessage(data, "The lookup failed."), "error");
             return;
           }
 
@@ -480,71 +1064,843 @@ if (inviteToken) {
             return;
           }
 
-          renderResult(parsed.data);
+          renderResult("isbn", parsed.data);
           setStatus("Match found.", "success");
         } finally {
           setLoading(false);
         }
       }
 
-      async function handleScan(): Promise<void> {
-        if (!videoEl || scanning) return;
-        scanning = true;
-        scanStartedAt = Date.now();
-        if (scanButton) scanButton.disabled = true;
-        setStatus("Scanning…", "info");
-
+      /**
+       * Continuously decode barcodes from the live stream while `Scan ISBN` is
+       * active. Each newly detected ISBN (one that differs from the code already
+       * in "Manual ISBN") is dropped into the input and turns the "Look up"
+       * button green; the loop never pauses, so scanning stays uninterrupted and
+       * the user taps "Look up" to resolve the number. Frames with no barcode are
+       * a silent no-op.
+       */
+      async function runScanLoop(): Promise<void> {
+        if (scanLoopRunning) return;
+        scanLoopRunning = true;
         try {
-          let text = "";
-          try {
-            text = (await detectBarcodeText()) || "";
-          } catch {
-            setStatus(
-              "Could not read a barcode in this frame. Try again or type it manually.",
-              "warning",
-            );
-          }
-
-          const [candidate] = extractIsbnCandidates(text);
-          if (!candidate) {
-            if (text) {
-              setStatus(
-                "That barcode is not a valid ISBN. Enter it manually instead.",
-                "warning",
-              );
+          while (scanLoopEnabled && currentMode === "isbn" && isCameraActive()) {
+            if (document.hidden) {
+              await delay(WATCHDOG_INTERVAL_MS);
+              continue;
             }
-          } else if (isDuplicateScan(recentScan, candidate, Date.now())) {
-            setStatus(
-              "That ISBN was just scanned. Move to the next book.",
-              "info",
-            );
-          } else {
-            recentScan = { isbn: candidate, at: Date.now() };
+
+            let text = "";
+            try {
+              text = (await detectBarcodeText()) || "";
+            } catch {
+              // No barcode in this frame (or the decoder is warming up).
+              await delay(150);
+              continue;
+            }
+
+            // A mode switch can land while the decoder was awaiting.
+            if (!scanLoopEnabled || currentMode !== "isbn") break;
+            if (!isCameraActive()) break;
+
+            const [candidate] = extractIsbnCandidates(text);
+            // Only act on a genuinely new barcode so the same ISBN sitting in
+            // view does not re-fill the input or clobber the user's typing.
+            if (!candidate || candidate === lastScannedIsbn) {
+              await delay(150);
+              continue;
+            }
+
+            lastScannedIsbn = candidate;
             if (input) input.value = candidate;
-            await lookup(candidate);
+            updateLookupHighlight();
           }
         } finally {
-          scanning = false;
-          scanStartedAt = null;
-          if (scanButton) scanButton.disabled = false;
+          scanLoopRunning = false;
         }
       }
 
-      startButton?.addEventListener("click", () => {
-        void startCamera();
+      /** Enable and (re)start the continuous barcode loop. */
+      function startScanLoop(): void {
+        scanLoopEnabled = true;
+        void runScanLoop();
+      }
+
+      /** Disable the loop; the running iteration exits on its next check. */
+      function stopScanLoop(): void {
+        scanLoopEnabled = false;
+      }
+
+      // --- "Enter Book Title" mode ---------------------------------------
+
+      /**
+       * Map a catalog edition into the read-only saveable shape. Editions
+       * surfaced by a title search are catalog-backed (`verified: true`); the
+       * confidence is high when a real ISBN pins the edition, medium otherwise.
+       */
+      function editionToSaveable(edition: CatalogEdition): SaveableBook {
+        return {
+          isbn13:
+            edition.isbn13 ??
+            createLocalBookId(edition.title, edition.authors.join(", ")),
+          title: edition.title,
+          authors: edition.authors,
+          publisher: edition.publisher,
+          publishedYear: edition.publishedYear,
+          summary: null,
+          source: edition.source,
+          verified: true,
+          enriched: false,
+          confidence: edition.isbn13 ? "high" : "medium",
+        };
+      }
+
+      /** Search the catalog by title/author and render the best match read-only. */
+      async function searchCatalog(): Promise<void> {
+        const title = titleInput?.value.trim() ?? "";
+        if (title === "") {
+          setStatus("Type a title before searching.", "warning");
+          return;
+        }
+        const author = titleAuthorInput?.value.trim() ?? "";
+
+        clearResult("title");
+        clearCandidates(titleCandidates);
+        setTitleBusy(true);
+        setStatus("Searching Open Library and Google Books…", "info");
+        try {
+          let response: Response;
+          try {
+            response = await fetch("/api/title-lookup", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(author ? { title, author } : { title }),
+            });
+          } catch {
+            setStatus(
+              "Network error while contacting the lookup service.",
+              "error",
+            );
+            return;
+          }
+
+          const data: unknown = await response.json().catch(() => null);
+          if (!response.ok) {
+            setStatus(errorMessage(data, "The lookup failed."), "error");
+            return;
+          }
+
+          const parsed = TitleLookupResponseSchema.safeParse(data);
+          if (!parsed.success) {
+            setStatus("The lookup returned an unexpected response.", "error");
+            return;
+          }
+
+          // Offer every catalog hit as an editable, selectable candidate row
+          // (mirroring "Read Cover with AI") before resolving the top match.
+          renderCandidates(titleCandidates, parsed.data.editions, {
+            title,
+            author,
+          });
+
+          const [best] = parsed.data.editions;
+          if (!best) {
+            setStatus(
+              `No catalog match for “${title}”. Check the spelling and search again, or tap “Just Save It” to add it manually.`,
+              "warning",
+            );
+            return;
+          }
+
+          renderResult("title", editionToSaveable(best));
+          setStatus("Match found in the catalog.", "success");
+        } finally {
+          setTitleBusy(false);
+        }
+      }
+
+      /**
+       * Render the typed title/author as a user-confirmed **manual entry** and
+       * show it in the read-only "Match found" card. A manual entry is trusted
+       * at high confidence even though no catalog corroborated it.
+       */
+      function saveManualBook(): void {
+        const title = titleInput?.value.trim() ?? "";
+        if (title === "") {
+          setStatus("Enter a title before saving.", "warning");
+          return;
+        }
+        const book: SaveableBook = {
+          ...buildManualBook({
+            title,
+            author: titleAuthorInput?.value.trim() ?? "",
+          }),
+          confidence: "high",
+        };
+        // The manual entry replaces the search result, so the catalog
+        // candidates no longer correspond to what is shown.
+        clearCandidates(titleCandidates);
+        renderResult("title", book);
+        setStatus(
+          "Match found. Source: manual entry · not verified · not enriched · Confidence: high.",
+          "success",
+        );
+      }
+
+      /**
+       * Down-scale a captured/selected cover on a `<canvas>` (≤ 1024px longest
+       * edge, JPEG 0.8) so the base64 payload stays well under the 1 MB cap.
+       */
+      async function downscaleToJpegDataUrl(file: File): Promise<string> {
+        const bitmap = await createImageBitmap(file);
+        const scale = Math.min(
+          1,
+          COVER_MAX_EDGE / Math.max(bitmap.width, bitmap.height),
+        );
+        const width = Math.max(1, Math.round(bitmap.width * scale));
+        const height = Math.max(1, Math.round(bitmap.height * scale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          bitmap.close();
+          throw new Error("Canvas is unavailable");
+        }
+        context.drawImage(bitmap, 0, 0, width, height);
+        bitmap.close();
+        return canvas.toDataURL("image/jpeg", COVER_JPEG_QUALITY);
+      }
+
+      /** Release the cover-capture stream and detach the preview element. */
+      function releaseCoverStream(): void {
+        if (coverStream) {
+          for (const track of coverStream.getTracks()) track.stop();
+          coverStream = null;
+        }
+        if (coverVideoEl) coverVideoEl.srcObject = null;
+      }
+
+      /** Stop the cover camera (used when leaving the mode / after capture). */
+      function stopCoverCamera(): void {
+        releaseCoverStream();
+        if (coverCanvasEl) coverCanvasEl.hidden = true;
+      }
+
+      /** A user-facing message for a `getUserMedia` failure. */
+      function describeCameraError(error: unknown): string {
+        const name = error instanceof DOMException ? error.name : "";
+        if (name === "NotAllowedError" || name === "SecurityError") {
+          return "Camera permission was denied.";
+        }
+        if (name === "NotFoundError" || name === "OverconstrainedError") {
+          return "No camera was found.";
+        }
+        return "The camera could not be started.";
+      }
+
+      /**
+       * Start the live camera for a cover shot, preferring the rear/environment
+       * lens. Falls back to the OS file picker *only* when the camera is
+       * genuinely unavailable (unsupported, permission denied, or no device).
+       * Called automatically when the "Read Cover with AI" mode is selected.
+       */
+      async function startCoverCamera(): Promise<void> {
+        if (!coverVideoEl) return;
+        if (!llmUnlocked) {
+          promptForAi();
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setStatus(
+            "Live camera is unavailable here — choose a cover photo instead.",
+            "warning",
+          );
+          coverFileInput?.click();
+          return;
+        }
+
+        setStatus("Starting the camera…", "info");
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            // `ideal` keeps desktops (no rear lens) working instead of failing.
+            video: { facingMode: { ideal: "environment" } },
+            audio: false,
+          });
+        } catch (error) {
+          setStatus(
+            `${describeCameraError(error)} Choose a cover photo instead.`,
+            "warning",
+          );
+          coverFileInput?.click();
+          return;
+        }
+
+        coverStream = stream;
+        coverVideoEl.srcObject = stream;
+        if (coverCanvasEl) coverCanvasEl.hidden = true;
+        try {
+          await coverVideoEl.play();
+        } catch {
+          // Some browsers need a gesture to start playback; the panel is shown.
+        }
+        setStatus("Point the camera at the cover, then tap Capture.", "info");
+      }
+
+      /**
+       * Instant one-step capture: grab the current frame to an offscreen canvas
+       * and immediately run the cover-reading pipeline — **without** stopping
+       * the stream. The live viewfinder stays mounted and streaming so the user
+       * can adjust the book and capture again.
+       */
+      function captureAndReadCover(): void {
+        if (!coverVideoEl || !coverCanvasEl || !coverStream) return;
+        const width = coverVideoEl.videoWidth;
+        const height = coverVideoEl.videoHeight;
+        if (!width || !height) {
+          setStatus(
+            "The camera is still warming up — try again in a moment.",
+            "warning",
+          );
+          return;
+        }
+
+        const scale = Math.min(1, COVER_MAX_EDGE / Math.max(width, height));
+        const targetW = Math.max(1, Math.round(width * scale));
+        const targetH = Math.max(1, Math.round(height * scale));
+        coverCanvasEl.width = targetW;
+        coverCanvasEl.height = targetH;
+        const context = coverCanvasEl.getContext("2d");
+        if (!context) {
+          setStatus("Could not capture the frame.", "error");
+          return;
+        }
+        context.drawImage(coverVideoEl, 0, 0, targetW, targetH);
+        const image = coverCanvasEl.toDataURL("image/jpeg", COVER_JPEG_QUALITY);
+        // Intentionally do NOT stop the stream here — the viewfinder must stay
+        // live so the user can immediately retake the shot.
+        void extractCoverFromDataUrl(image);
+      }
+
+      /**
+       * Read a cover image (already a down-scaled JPEG data URL) in a single
+       * pass. The endpoint performs the whole pipeline — vision hint → catalog
+       * promotion → optional LLM enrichment — so the resolved result renders
+       * straight into "Match found" with no second lookup request.
+       */
+      async function extractCoverFromDataUrl(image: string): Promise<void> {
+        if (!llmUnlocked) {
+          promptForAi();
+          return;
+        }
+
+        clearResult("cover");
+        clearCandidates(coverCandidates);
+        // Disable Capture only while this request is in flight; the live
+        // viewfinder keeps running beneath it.
+        if (coverCaptureButton) coverCaptureButton.disabled = true;
+        setStatus("Reading cover…", "info");
+        try {
+          let response: Response;
+          try {
+            response = await fetch("/api/books/extract-cover", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ image }),
+            });
+          } catch {
+            setStatus("Network error while reading the cover.", "error");
+            return;
+          }
+
+          const data: unknown = await response.json().catch(() => null);
+          if (!response.ok) {
+            if (response.status === 401) {
+              signedIn = false;
+              syncAiGates();
+              setStatus("Sign in to read book covers with AI.", "warning");
+              return;
+            }
+            if (response.status === 403) {
+              llmUnlocked = false;
+              syncAiGates();
+              setStatus(
+                `Unlock AI features for $${unlockPrice} to read covers.`,
+                "warning",
+              );
+              return;
+            }
+            setStatus(
+              errorMessage(data, "Could not read that cover."),
+              "error",
+            );
+            return;
+          }
+
+          const parsed = CoverLookupResponseSchema.safeParse(data);
+          if (!parsed.success) {
+            setStatus("The AI returned an unexpected response.", "error");
+            return;
+          }
+
+          // Single-pass: the endpoint already resolved the catalog match (and
+          // any LLM enrichment), so render the match directly — no secondary
+          // `/api/isbn-lookup` or `/api/title-lookup` request. `renderCoverMatch`
+          // also surfaces the mode-appropriate "no catalog match" message when
+          // only the vision hints were available. The catalog's candidate
+          // editions populate "Possible Book Titles" below the camera.
+          renderCoverMatch(parsed.data);
+          renderCandidates(coverCandidates, parsed.data.candidates, {
+            title: parsed.data.title,
+            author: parsed.data.authors.join(", "),
+          });
+        } finally {
+          if (coverCaptureButton) coverCaptureButton.disabled = false;
+        }
+      }
+
+      /** Fallback path: down-scale a picked photo file, then read it. */
+      async function handleCoverFile(file: File): Promise<void> {
+        if (!llmUnlocked) {
+          promptForAi();
+          return;
+        }
+        setStatus("Preparing image…", "info");
+        let image: string;
+        try {
+          image = await downscaleToJpegDataUrl(file);
+        } catch {
+          setStatus(
+            "Could not read that image. Try a different photo.",
+            "error",
+          );
+          return;
+        }
+        await extractCoverFromDataUrl(image);
+      }
+
+      /** Prompt the current free tier to sign in or unlock the AI features. */
+      function promptForAi(): void {
+        if (!signedIn) {
+          setStatus("Sign in to read book covers with AI.", "warning");
+          syncAiGates();
+          return;
+        }
+        setStatus(
+          `Unlock AI features for $${unlockPrice} to read book covers.`,
+          "warning",
+        );
+        syncAiGates();
+      }
+
+      /**
+       * Flip the client into the AI-enabled state once a credit balance is
+       * confirmed. AI access is credit-derived, so a positive balance (not a
+       * one-time flag) is what unlocks the features.
+       */
+      function applyCreditState(balance: number): void {
+        creditBalance = Math.max(0, balance);
+        llmUnlocked = creditBalance > 0;
+        if (enrichSetting) enrichSetting.disabled = false;
+        syncAiGates();
+        setEnrichStatus(
+          `AI credit available: ${formatCredit(creditBalance)}.`,
+          "success",
+        );
+        setStatus("AI features unlocked.", "success");
+      }
+
+      /**
+       * Start the $0.99 HitPay credit top-up and hand the browser off to the
+       * hosted payment page. Fulfilment happens server-side (webhook + the
+       * return-time reconcile); when HitPay redirects back here,
+       * {@link pollForUnlock} flips the UI to unlocked (even if the webhook
+       * lands a beat later).
+       */
+      async function unlockAi(): Promise<void> {
+        if (!unlockButton) return;
+        unlockButton.disabled = true;
+        setEnrichStatus("Starting secure checkout…", "info");
+        try {
+          const response = await fetch("/api/shelves/checkout", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ returnTo: "/" }),
+          });
+          const data = (await response.json().catch(() => null)) as {
+            ok?: boolean;
+            url?: string | null;
+            message?: string;
+          } | null;
+          if (!response.ok || data?.ok !== true) {
+            setEnrichStatus(
+              response.status === 401
+                ? "Sign in to unlock AI features."
+                : errorMessage(data, "Could not start checkout."),
+              response.status === 401 ? "warning" : "error",
+            );
+            unlockButton.disabled = false;
+            return;
+          }
+          if (typeof data.url !== "string" || data.url === "") {
+            setEnrichStatus(
+              "Could not start checkout. Please try again shortly.",
+              "error",
+            );
+            unlockButton.disabled = false;
+            return;
+          }
+          // Navigating away to HitPay; leave the button disabled so a second
+          // click cannot open a duplicate charge.
+          window.location.href = data.url;
+        } catch {
+          setEnrichStatus("Network error while starting checkout.", "error");
+          unlockButton.disabled = false;
+        }
+      }
+
+      /** True when the page was reached by returning from the HitPay checkout. */
+      function isUnlockReturn(): boolean {
+        try {
+          return (
+            new URL(window.location.href).searchParams.get("unlock") === "return"
+          );
+        } catch {
+          return false;
+        }
+      }
+
+      /** The HitPay payment reference carried back in the return URL, if any. */
+      function getReturnReference(): string | null {
+        try {
+          const value = new URL(window.location.href).searchParams.get("ref");
+          return value && value !== "" ? value : null;
+        } catch {
+          return null;
+        }
+      }
+
+      /** Read the current credit balance from the entitlement endpoint. */
+      async function fetchCreditBalance(): Promise<number | null> {
+        try {
+          const response = await fetch("/api/shelves/entitlement");
+          const data = (await response.json().catch(() => null)) as {
+            signedIn?: boolean;
+            creditBalance?: number;
+          } | null;
+          if (data?.signedIn === false) {
+            setEnrichStatus("Sign in to finish adding AI credit.", "warning");
+            return null;
+          }
+          if (!response.ok) return null;
+          return typeof data?.creditBalance === "number" ? data.creditBalance : null;
+        } catch {
+          return null;
+        }
+      }
+
+      type ReconcileOutcome = "completed" | "pending" | "failed" | "unknown" | "error";
+
+      /**
+       * Confirm a HitPay top-up via the server reconcile endpoint, which checks
+       * the payment's real status directly with HitPay (the deprecated
+       * per-request webhook is not always delivered). On success the balance is
+       * credited idempotently and surfaced here.
+       */
+      async function reconcilePayment(reference: string): Promise<ReconcileOutcome> {
+        try {
+          const response = await fetch("/api/shelves/reconcile-payment", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reference }),
+          });
+          const data = (await response.json().catch(() => null)) as {
+            ok?: boolean;
+            status?: string;
+            credited?: boolean;
+            amount?: number;
+            balance?: number;
+          } | null;
+          if (!response.ok || data?.ok !== true) return "error";
+          if (data.status === "completed") {
+            const balance =
+              typeof data.balance === "number" ? data.balance : creditBalance;
+            const added = typeof data.amount === "number" ? data.amount : 0;
+            applyCreditState(balance);
+            // One-time success banner for the live return (regardless of
+            // whether this call or the webhook credited the balance).
+            showPaymentSuccess(balance);
+            // `credited` is false on an idempotent re-confirm, so only announce
+            // the amount when this call actually moved the balance.
+            if (data.credited === true) {
+              setEnrichStatus(
+                `Payment of ${formatCredit(added)} is successful. Balance: ${formatCredit(balance)}.`,
+                "success",
+              );
+            }
+            return "completed";
+          }
+          if (data.status === "failed") {
+            setEnrichStatus(
+              "Payment was not completed. You have not been charged.",
+              "error",
+            );
+            return "failed";
+          }
+          if (data.status === "pending") return "pending";
+          return "unknown";
+        } catch {
+          return "error";
+        }
+      }
+
+      /**
+       * After HitPay redirects back, confirm the payment and refresh the credit
+       * balance without a manual reload. Prefers the server-side reconcile
+       * (which checks HitPay directly) and falls back to polling the entitlement
+       * endpoint in case the webhook already credited the ledger. Shows clear
+       * success / pending / failed feedback.
+       */
+      async function pollForUnlock(attempts = 8, delayMs = 1500): Promise<void> {
+        const reference = getReturnReference();
+        let sawPending = false;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          if (reference) {
+            const outcome = await reconcilePayment(reference);
+            if (outcome === "completed" || outcome === "failed") {
+              clearUnlockReturnParam();
+              return;
+            }
+            if (outcome === "pending") {
+              sawPending = true;
+              setEnrichStatus("Payment received — confirming with HitPay…", "info");
+            }
+          }
+          const balance = await fetchCreditBalance();
+          if (balance !== null && balance > 0) {
+            applyCreditState(balance);
+            showPaymentSuccess(balance);
+            clearUnlockReturnParam();
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, delayMs);
+          });
+        }
+        setEnrichStatus(
+          sawPending
+            ? "Your payment is still pending confirmation with HitPay. Reopen this page in a moment if AI stays locked."
+            : "Still confirming your payment — reopen this page in a moment if AI stays locked.",
+          "warning",
+        );
+      }
+
+      /** Drop the `?unlock=return` marker so a refresh does not re-poll. */
+      function clearUnlockReturnParam(): void {
+        try {
+          const url = new URL(window.location.href);
+          if (!url.searchParams.has("unlock")) return;
+          url.searchParams.delete("unlock");
+          window.history.replaceState(null, "", url.toString());
+        } catch {
+          // Non-fatal: leaving the marker only means one more poll on refresh.
+        }
+      }
+
+      /**
+       * Switch scanner mode: toggle the mode's panel, stop whichever camera the
+       * new mode does not own, and start the camera the new mode needs. Both
+       * "Scan ISBN" and "Read Cover with AI" open their camera immediately.
+       */
+      function applyMode(mode: Mode): void {
+        currentMode = mode;
+        if (cameraPanel) cameraPanel.hidden = mode !== "isbn";
+        if (isbnPanel) isbnPanel.hidden = mode !== "isbn";
+        if (titlePanel) titlePanel.hidden = mode !== "title";
+        if (coverPanel) coverPanel.hidden = mode !== "cover";
+
+        // Only one camera may run at a time. Each mode keeps its own "Match
+        // found" card and "Possible Book Titles" list: they live inside the
+        // mode's panel, so a switch hides — but never discards — the results,
+        // and switching back restores them untouched.
+        if (mode !== "isbn") {
+          stopScanLoop();
+          if (isCameraActive()) stopCamera();
+        }
+        if (mode !== "cover") stopCoverCamera();
+        updateLookupHighlight();
+
+        // The main page heading tracks the active mode.
+        if (pageHeading) {
+          pageHeading.textContent =
+            mode === "isbn"
+              ? "ISBN Scanner"
+              : mode === "title"
+                ? "Manual Entry of Book Title"
+                : "Read Title from Book Cover by AI";
+        }
+
+        if (mode === "isbn") {
+          if (modeHint) {
+            modeHint.textContent =
+              "Scan ISBN is the fastest, most accurate path — it resolves the exact edition from the barcode.";
+          }
+          if (!isCameraActive()) {
+            void startCamera();
+          } else {
+            setStatus(
+              "Scanning… point the next book's barcode at the camera.",
+              "info",
+            );
+          }
+        } else if (mode === "title") {
+          if (modeHint) {
+            modeHint.textContent =
+              "Enter Book Title searches Open Library / Google Books by title and author — useful when there is no scannable barcode.";
+          }
+          syncAiGates();
+          setStatus("Enter a title (and optional author), then tap Search.", "info");
+        } else {
+          if (modeHint) {
+            modeHint.textContent =
+              "Read Cover with AI photographs the cover, reads the title, then verifies it against Open Library / Google Books.";
+          }
+          syncAiGates();
+          void startCoverCamera();
+        }
+      }
+
+      // --- LLM enrichment preference -------------------------------------
+      const enrichRadios = enrichSetting
+        ? Array.from(
+            enrichSetting.querySelectorAll<HTMLInputElement>(
+              'input[name="enrichWithLlm"]',
+            ),
+          )
+        : [];
+      // The server-rendered selection; kept in sync so a failed save can revert.
+      let savedEnrichWithLlm =
+        enrichRadios.find((radio) => radio.checked)?.value === "yes";
+
+      function setEnrichStatus(message: string, tone: string): void {
+        if (!enrichStatus) return;
+        enrichStatus.textContent = message;
+        enrichStatus.dataset.tone = tone;
+        enrichStatus.hidden = false;
+      }
+
+      /** Persist the preference immediately; the lookup route reads it back. */
+      async function saveEnrichSetting(enrichWithLlm: boolean): Promise<void> {
+        if (!enrichSetting) return;
+        for (const radio of enrichRadios) radio.disabled = true;
+        if (enrichStatus) enrichStatus.hidden = true;
+        try {
+          const response = await fetch("/api/shelves/enrich-setting", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enrichWithLlm }),
+          });
+          const payload = (await response.json().catch(() => null)) as
+            | { ok?: boolean; enrichWithLlm?: boolean; message?: string }
+            | null;
+          if (!response.ok || !payload?.ok) {
+            for (const radio of enrichRadios) {
+              radio.checked = radio.value === (savedEnrichWithLlm ? "yes" : "no");
+            }
+            setEnrichStatus(
+              payload?.message ?? "Could not save the preference.",
+              "error",
+            );
+            return;
+          }
+          savedEnrichWithLlm = payload.enrichWithLlm === true;
+          for (const radio of enrichRadios) {
+            radio.checked = radio.value === (savedEnrichWithLlm ? "yes" : "no");
+          }
+          setEnrichStatus(
+            savedEnrichWithLlm
+              ? "Saved. New scans will also be enriched with the LLM."
+              : "Saved. New scans skip LLM enrichment and use the catalog only.",
+            "success",
+          );
+        } catch {
+          for (const radio of enrichRadios) {
+            radio.checked = radio.value === (savedEnrichWithLlm ? "yes" : "no");
+          }
+          setEnrichStatus("Network error while saving the preference.", "error");
+        } finally {
+          for (const radio of enrichRadios) radio.disabled = false;
+        }
+      }
+
+      enrichSetting?.addEventListener("change", (event) => {
+        const input = event.target as HTMLInputElement | null;
+        if (!input || input.name !== "enrichWithLlm") return;
+        void saveEnrichSetting(input.value === "yes");
       });
-      stopButton?.addEventListener("click", stopCamera);
-      scanButton?.addEventListener("click", () => {
-        void handleScan();
-      });
+
       restartButton?.addEventListener("click", () => {
         void restartCamera();
       });
+      cameraRetryButton?.addEventListener("click", () => {
+        void restartCamera();
+      });
+      input?.addEventListener("input", updateLookupHighlight);
+
+      // --- Scan mode wiring ----------------------------------------------
+      const modeRadios = modeSetting
+        ? Array.from(
+            modeSetting.querySelectorAll<HTMLInputElement>(
+              'input[name="scanMode"]',
+            ),
+          )
+        : [];
+      for (const radio of modeRadios) {
+        radio.addEventListener("change", () => {
+          if (!radio.checked) return;
+          const value = radio.value;
+          applyMode(
+            value === "title" || value === "cover" ? value : "isbn",
+          );
+        });
+      }
+
+      coverCaptureButton?.addEventListener("click", captureAndReadCover);
+
+      coverFileInput?.addEventListener("change", () => {
+        const file = coverFileInput.files?.[0];
+        // Reset so re-selecting the same file still fires a change event.
+        coverFileInput.value = "";
+        if (file) void handleCoverFile(file);
+      });
+
+      unlockButton?.addEventListener("click", () => {
+        void unlockAi();
+      });
+
+      titleForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void searchCatalog();
+      });
+
+      titleSaveButton?.addEventListener("click", () => {
+        void saveManualBook();
+      });
 
       // Returning to the tab invalidates stale samples; hidden tabs skip checks.
+      // A hidden tab also releases the cover camera.
       document.addEventListener("visibilitychange", () => {
         lastVideoSample = null;
         stalledSince = null;
+        if (document.hidden) stopCoverCamera();
+      });
+
+      // Release every camera stream if the page is navigated away / unloaded,
+      // so no `MediaStream` track is left active in the background.
+      window.addEventListener("pagehide", () => {
+        stopCamera();
+        releaseCoverStream();
       });
 
       form?.addEventListener("submit", (event) => {
@@ -555,8 +1911,22 @@ if (inviteToken) {
           setStatus("Enter an ISBN before looking up.", "warning");
           return;
         }
+        // Submitting marks this value as looked up, dropping the green highlight.
+        lastLookedUpIsbn = value;
+        updateLookupHighlight();
         void lookup(value);
       });
+
+      // Reflect the server-resolved tier in the AI gates on first paint.
+      syncAiGates();
+      applyMode(currentMode);
+
+      // HitPay redirects the shopper back with `?unlock=return&ref=…`; reconcile
+      // the payment, show the outcome, and refresh the credit balance without a
+      // manual reload (the webhook may lag the redirect, or never arrive).
+      if (signedIn && isUnlockReturn()) {
+        void pollForUnlock();
+      }
     </script>
 
     <style>
@@ -636,7 +2006,21 @@ if (inviteToken) {
         gap: 0.5rem;
       }
 
-      button {
+      /* `display: flex` beats the UA `[hidden]` rule, so the attribute must be
+         honoured explicitly — this is what actually hides the "$0.99 unlock"
+         row once credit remains. */
+      .controls[hidden] {
+        display: none;
+      }
+
+      /* Shared form-control styling. The "Manual ISBN" input and "Look up"
+         button are the canonical reference: every "All Possible Book Titles"
+         field and action button reuses the same `field-input` / `field-button`
+         rules so height, padding, border, radius, fill, font size, and
+         hover/active states stay identical. Bare `input` / `button` keep the
+         same styling for controls that do not opt into the named classes. */
+      button,
+      .field-button {
         flex: 1 1 auto;
         padding: 0.6rem 0.9rem;
         border-radius: 0.5rem;
@@ -652,12 +2036,69 @@ if (inviteToken) {
         cursor: not-allowed;
       }
 
+      /* A fresh, not-yet-resolved ISBN is loaded — prompt the user to look it up. */
+      button.highlight {
+        background: #059669;
+        border-color: #047857;
+        color: #fff;
+      }
+
+      button.highlight:hover {
+        background: #047857;
+      }
+
+      /* "Select" / "Save to my shelf" sit outside a flex row, so `.action-button`
+         adds the full width the "Look up" / "Search" / "Just Save It" buttons get
+         for free from stretching inside `.controls`. */
+      .action-button {
+        width: 100%;
+        flex: 1 1 auto;
+      }
+
       label {
         font-size: 0.85rem;
         opacity: 0.8;
       }
 
-      input {
+      .enrich-setting,
+      .mode-setting {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1rem;
+        margin: 0;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid #3a4150;
+        border-radius: 0.5rem;
+      }
+
+      .enrich-setting legend,
+      .mode-setting legend {
+        padding: 0 0.4rem;
+        font-size: 0.85rem;
+        opacity: 0.8;
+      }
+
+      .enrich-setting label,
+      .mode-setting label {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        opacity: 1;
+      }
+
+      .enrich-setting:disabled {
+        opacity: 0.6;
+      }
+
+      .hint {
+        margin: 0;
+        font-size: 0.8rem;
+        opacity: 0.7;
+      }
+
+      input,
+      .field-input {
         flex: 1 1 12rem;
         padding: 0.6rem 0.9rem;
         border-radius: 0.5rem;
@@ -672,6 +2113,10 @@ if (inviteToken) {
         padding: 0.75rem 1rem;
         border-radius: 0.5rem;
         background: #1b1f28;
+      }
+
+      .status[hidden] {
+        display: none;
       }
 
       .status[data-tone="warning"] {
@@ -698,6 +2143,56 @@ if (inviteToken) {
 
       .result p {
         margin: 0.25rem 0;
+      }
+
+      input[type="radio"] {
+        flex: none;
+        width: auto;
+        padding: 0;
+        border: 0;
+        background: none;
+        accent-color: #6ea8fe;
+      }
+
+      #isbn-panel {
+        display: grid;
+        gap: 1rem;
+      }
+
+      #camera-panel[hidden],
+      #isbn-panel[hidden],
+      #title-panel[hidden],
+      #cover-panel[hidden] {
+        display: none;
+      }
+
+      #title-form {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .result .match-title {
+        font-weight: 600;
+      }
+
+      /* "Possible Book Titles" — a stacked list of editable candidate rows that
+         mirrors the "Manual ISBN" block beneath the Scan ISBN camera. */
+      .candidates-heading {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .candidate-list {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .candidate {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.75rem;
+        border: 1px solid #2a2f3a;
+        border-radius: 0.5rem;
       }
     </style>
   </body>

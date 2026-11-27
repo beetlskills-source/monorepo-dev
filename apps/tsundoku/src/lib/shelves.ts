@@ -80,6 +80,31 @@ export interface SharedShelfView {
   rows: ShelfRow[];
 }
 
+/**
+ * The viewer-safe projection of a shared shelf. It deliberately omits the
+ * owner's `spreadsheetId`, `sheetTabName`, and live `title` so a viewer can
+ * never locate, open, or inspect the owner's underlying Google Sheet — shared
+ * books are read-only and only ever surface through this list.
+ */
+export type PublicSharedShelf = Omit<
+  SharedShelfView,
+  "spreadsheetId" | "sheetTabName" | "title"
+>;
+
+/** Strip the owner's sheet identifiers from a shared shelf before it leaves the
+ * server (e.g. in the `/api/shelves/shared` JSON payload). */
+export function toPublicSharedShelf(shelf: SharedShelfView): PublicSharedShelf {
+  return {
+    ownerId: shelf.ownerId,
+    ownerEmail: shelf.ownerEmail,
+    ownerName: shelf.ownerName,
+    status: shelf.status,
+    message: shelf.message,
+    groupIds: shelf.groupIds,
+    rows: shelf.rows,
+  };
+}
+
 /** KV cache value: the owner's raw mapped rows, before per-viewer filtering. */
 interface SharedShelfCacheValue {
   title: string | null;

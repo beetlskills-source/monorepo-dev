@@ -1,7 +1,9 @@
 import {
   BookEnrichmentSchema,
+  CoverExtractionSchema,
   type BookEnrichment,
   type CatalogBook,
+  type CoverExtraction,
 } from "@repo/book-schemas";
 
 /**
@@ -16,6 +18,13 @@ export const FEATHERLESS_ENDPOINT =
 
 /** Default model, used when `FEATHERLESS_MODEL` is not configured. */
 export const DEFAULT_FEATHERLESS_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct";
+
+/**
+ * Default multimodal model, used when `FEATHERLESS_VISION_MODEL` is not
+ * configured. A vision-language model that accepts OpenAI-style
+ * `type: "image_url"` content parts.
+ */
+export const DEFAULT_FEATHERLESS_VISION_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct";
 
 /**
  * Abort hung upstream requests after this many milliseconds. A large instruct
@@ -46,9 +55,56 @@ export interface FeatherlessClientOptions {
   temperature?: number;
 }
 
+/**
+ * One book in a bulk enrichment request. `key` is an opaque caller correlation
+ * token (e.g. a spreadsheet row index) echoed back in the result so the caller
+ * can map a returned `summary` to its exact source row even when two rows share
+ * an ISBN.
+ */
+export interface BatchEnrichmentInput {
+  key: string;
+  isbn13: string;
+  title: string;
+  authors: string[];
+  publisher?: string | null;
+  publishedYear?: number | null;
+}
+
+/** Correlation key → non-empty summary, for books the model could enrich. */
+export type BatchEnrichmentMap = Map<string, string>;
+
+/**
+ * OpenAI-compatible chat content: either a plain string or a multimodal parts
+ * array (`text` + `image_url`), matching the Featherless `chat/completions`
+ * contract for vision models.
+ */
+export type ChatMessageContent =
+  | string
+  | Array<
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } }
+    >;
+
+export interface ChatMessage {
+  role: string;
+  content: ChatMessageContent;
+}
+
 export interface FeatherlessClient {
   /** Enrich a catalog-verified book with a summary (and optional topics). */
   enrichBook(book: CatalogBook): Promise<BookEnrichment>;
+  /**
+   * Enrich many books in a single request, returning a `key → summary` map.
+   * Books the model cannot summarise are simply absent from the map.
+   */
+  enrichBooks(books: BatchEnrichmentInput[]): Promise<BatchEnrichmentMap>;
+  /**
+   * Read title/subtitle/authors/publisher/isbn hints off a book cover photo (a
+   * base64 `data:` URL). Uses the client's configured (multimodal) model. The
+   * result is grounded-only (null/empty for anything not clearly visible) and
+   * is treated by the caller as a lookup hint, not authoritative metadata.
+   */
+  extractCover(imageDataUrl: string): Promise<CoverExtraction>;
 }
 
 const SYSTEM_PROMPT = [
@@ -60,6 +116,43 @@ const SYSTEM_PROMPT = [
   "Write a concise 2-4 sentence summary grounded only in the provided title",
   "and authors. If you are unsure, set summary to null rather than guessing.",
   "Never add or restate a title or author list in your output.",
+].join(" ");
+
+const BATCH_SYSTEM_PROMPT = [
+  "You enrich catalog-verified book metadata in bulk.",
+  "Respond with a single strict JSON object and nothing else.",
+  "The object must match exactly this shape:",
+  '{"summaries": [{"key": string, "summary": string | null}]}',
+  "Return exactly one entry per input book, echoing its key unchanged.",
+  "Write a concise 2-4 sentence summary grounded only in the provided title",
+  "and authors. If you are unsure, set summary to null rather than guessing.",
+  "Never add or restate a title or author list in your output.",
+].join(" ");
+
+const VISION_SYSTEM_PROMPT = [
+  "You read book metadata from a photo of a book cover.",
+  "Respond with a single strict JSON object and nothing else.",
+  "The object must match exactly this shape:",
+  '{"title": string, "subtitle": string | null, "authors": string[], "publisher": string | null, "isbn": string | null}',
+  "Combine a multi-line display title into ONE coherent title string:",
+  'split lines "The $100" / "Startup" become "The $100 Startup",',
+  '"Rocks" / "& Minerals" becomes "Rocks & Minerals", and Chinese cover',
+  "titles are joined without inserting spaces.",
+  "Read English covers and Chinese covers accurately, including Simplified and",
+  "Traditional Chinese. Keep a secondary/subtitle line in 'subtitle', not 'title'.",
+  "Keep 'title' a clean book title ONLY: never prefix it with the author's",
+  "name or a possessive, e.g. output \"The $100 Startup\", never",
+  "\"Chris Guillebeau's The $100 Startup\" or \"by Chris Guillebeau\".",
+  "Ground every value in the pixels you can actually see. Return an author in",
+  "'authors' ONLY when that name is clearly printed and legible on the cover:",
+  "if the author text is blurry, cut off, absent, or you are unsure, return an",
+  "empty array. Never guess an author from prior knowledge, the title, or the",
+  "topic.",
+  "Include 'publisher' only when it is clearly printed on the cover.",
+  "Include 'isbn' only when the digits are clearly legible, and return them as a",
+  "plain string of digits (no hyphens); otherwise use null.",
+  "For any field you cannot read clearly, use null (or an empty array for",
+  "authors) instead of guessing.",
 ].join(" ");
 
 /** Remove a surrounding ```json ... ``` markdown fence, if present. */
@@ -144,6 +237,83 @@ function buildBookContext(book: CatalogBook): string {
 }
 
 /**
+ * Coerce a batch model response into a `key → summary` map, keeping only
+ * entries with a non-blank key and a non-blank summary. A missing `summaries`
+ * list is an upstream error; individual malformed entries are skipped so one
+ * bad row never discards the whole batch.
+ */
+function normalizeBatchSummaries(
+  parsed: Record<string, unknown>,
+): BatchEnrichmentMap {
+  const entries = parsed.summaries;
+  if (!Array.isArray(entries)) {
+    throw new UpstreamError("Featherless batch output was missing a summaries list");
+  }
+
+  const result: BatchEnrichmentMap = new Map();
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const key = typeof record.key === "string" ? record.key.trim() : "";
+    const summary =
+      typeof record.summary === "string" ? record.summary.trim() : "";
+    if (key !== "" && summary !== "") {
+      result.set(key, summary);
+    }
+  }
+  return result;
+}
+
+/** Build the user message listing every book in a batch request. */
+function buildBatchContext(books: BatchEnrichmentInput[]): string {
+  const payload = {
+    books: books.map((book) => ({
+      key: book.key,
+      isbn13: book.isbn13,
+      title: book.title,
+      authors: book.authors,
+      publisher: book.publisher ?? null,
+      publishedYear: book.publishedYear ?? null,
+    })),
+  };
+  return `Enrich these books:\n${JSON.stringify(payload)}`;
+}
+
+/**
+ * Coerce loosely-typed vision output into {@link CoverExtractionSchema}'s shape
+ * before validation: a blank title/subtitle/publisher/isbn becomes `null`,
+ * authors keep only non-empty strings, and any stray newlines in the title
+ * collapse to single spaces so a multi-line display title arrives as one clean
+ * clause. Author grounding (empty when nothing is legible) is enforced by the
+ * prompt; `isbn` is kept as an unvalidated lookup hint.
+ */
+function normalizeCover(parsed: Record<string, unknown>): unknown {
+  const title =
+    typeof parsed.title === "string"
+      ? parsed.title.trim().replace(/\s+/g, " ")
+      : "";
+  const subtitle =
+    typeof parsed.subtitle === "string" ? parsed.subtitle.trim() : "";
+  const publisher =
+    typeof parsed.publisher === "string" ? parsed.publisher.trim() : "";
+  const isbn = typeof parsed.isbn === "string" ? parsed.isbn.trim() : "";
+  const authors = Array.isArray(parsed.authors)
+    ? parsed.authors
+        .filter((author): author is string => typeof author === "string")
+        .map((author) => author.trim())
+        .filter((author) => author !== "")
+    : [];
+
+  return {
+    title,
+    subtitle: subtitle === "" ? null : subtitle,
+    authors,
+    publisher: publisher === "" ? null : publisher,
+    isbn: isbn === "" ? null : isbn,
+  };
+}
+
+/**
  * Create an injectable Featherless AI enrichment client. The client never reads
  * secrets itself; the caller passes the server-side API key explicitly.
  */
@@ -158,58 +328,109 @@ export function createFeatherlessClient(
     temperature = DEFAULT_TEMPERATURE,
   } = options;
 
+  /**
+   * POST one completion and return the parsed JSON object from the model's
+   * message. Shared by the single and batch methods so both inherit the same
+   * timeout, error, and fence-handling behaviour.
+   */
+  async function callModel(
+    messages: ChatMessage[],
+  ): Promise<Record<string, unknown>> {
+    const payload = {
+      model,
+      temperature,
+      messages,
+      response_format: { type: "json_object" },
+    };
+
+    let response: Response;
+    try {
+      response = await fetchImpl(FEATHERLESS_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      throw new UpstreamError("Featherless request failed or timed out");
+    }
+
+    if (!response.ok) {
+      throw new UpstreamError(
+        `Featherless responded with status ${response.status}`,
+      );
+    }
+
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      throw new UpstreamError("Featherless returned an invalid JSON response");
+    }
+
+    const content = extractMessageContent(data);
+    if (content === null) {
+      throw new UpstreamError("Featherless response was missing message content");
+    }
+
+    return parseModelJson(content);
+  }
+
   return {
     async enrichBook(book: CatalogBook): Promise<BookEnrichment> {
-      const payload = {
-        model,
-        temperature,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `Enrich this book:\n${buildBookContext(book)}`,
-          },
-        ],
-        response_format: { type: "json_object" },
-      };
+      const parsed = await callModel([
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `Enrich this book:\n${buildBookContext(book)}`,
+        },
+      ]);
 
-      let response: Response;
-      try {
-        response = await fetchImpl(FEATHERLESS_ENDPOINT, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-      } catch {
-        throw new UpstreamError("Featherless request failed or timed out");
-      }
-
-      if (!response.ok) {
-        throw new UpstreamError(
-          `Featherless responded with status ${response.status}`,
-        );
-      }
-
-      let data: unknown;
-      try {
-        data = await response.json();
-      } catch {
-        throw new UpstreamError("Featherless returned an invalid JSON response");
-      }
-
-      const content = extractMessageContent(data);
-      if (content === null) {
-        throw new UpstreamError("Featherless response was missing message content");
-      }
-
-      const parsed = parseModelJson(content);
       const result = BookEnrichmentSchema.safeParse(normalizeEnrichment(parsed));
       if (!result.success) {
         throw new UpstreamError("Featherless output failed schema validation");
+      }
+
+      return result.data;
+    },
+
+    async enrichBooks(
+      books: BatchEnrichmentInput[],
+    ): Promise<BatchEnrichmentMap> {
+      // Nothing to ask for; skip the upstream call entirely.
+      if (books.length === 0) return new Map();
+
+      const parsed = await callModel([
+        { role: "system", content: BATCH_SYSTEM_PROMPT },
+        { role: "user", content: buildBatchContext(books) },
+      ]);
+
+      return normalizeBatchSummaries(parsed);
+    },
+
+    async extractCover(imageDataUrl: string): Promise<CoverExtraction> {
+      const parsed = await callModel([
+        { role: "system", content: VISION_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Extract the title, subtitle, authors, publisher, and ISBN from this book cover. Only report text you can clearly see.",
+            },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ]);
+
+      const result = CoverExtractionSchema.safeParse(normalizeCover(parsed));
+      if (!result.success) {
+        throw new UpstreamError(
+          "Featherless vision output failed schema validation",
+        );
       }
 
       return result.data;

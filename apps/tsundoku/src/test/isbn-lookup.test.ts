@@ -102,7 +102,9 @@ function mockFetch(router: (url: string) => Response) {
   return { mock: mock as unknown as typeof fetch, urls };
 }
 
-const BASE_DEPS = { apiKey: "test-key" } as const;
+// The caller's saved "Enrich book info with LLM" preference now gates
+// enrichment, so the existing enrichment expectations opt in explicitly.
+const BASE_DEPS = { apiKey: "test-key", enrich: true } as const;
 
 describe("handleIsbnLookup", () => {
   describe("400 INVALID_ISBN", () => {
@@ -174,6 +176,72 @@ describe("handleIsbnLookup", () => {
         enriched: false,
       });
       expect(urls.some((url) => url.includes("featherless"))).toBe(false);
+    });
+  });
+
+  describe("enrichment gating on the saved preference", () => {
+    it("skips the LLM when the preference is off even with an API key configured", async () => {
+      const { mock, urls } = mockFetch((url) =>
+        url.includes("openlibrary.org")
+          ? openLibraryHit(VALID_ISBN13)
+          : featherlessResponse(enrichmentContent("should not be used")),
+      );
+
+      const response = await handleIsbnLookup(makeContext({ isbn: VALID_ISBN13 }), {
+        apiKey: "test-key",
+        enrich: false,
+        fetchImpl: mock,
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        title: "The C Programming Language",
+        summary: null,
+        enriched: false,
+      });
+      // The fast catalog-only path must never touch Featherless.
+      expect(urls.some((url) => url.includes("featherless"))).toBe(false);
+    });
+
+    it("defaults to no enrichment when the preference is unset", async () => {
+      const { mock, urls } = mockFetch((url) =>
+        url.includes("openlibrary.org")
+          ? openLibraryHit(VALID_ISBN13)
+          : featherlessResponse(enrichmentContent("should not be used")),
+      );
+
+      const response = await handleIsbnLookup(makeContext({ isbn: VALID_ISBN13 }), {
+        apiKey: "test-key",
+        fetchImpl: mock,
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        summary: null,
+        enriched: false,
+      });
+      expect(urls.some((url) => url.includes("featherless"))).toBe(false);
+    });
+
+    it("runs enrichment when the preference is on", async () => {
+      const { mock, urls } = mockFetch((url) =>
+        url.includes("openlibrary.org")
+          ? openLibraryHit(VALID_ISBN13)
+          : featherlessResponse(enrichmentContent("Enabled summary.")),
+      );
+
+      const response = await handleIsbnLookup(makeContext({ isbn: VALID_ISBN13 }), {
+        apiKey: "test-key",
+        enrich: true,
+        fetchImpl: mock,
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        summary: "Enabled summary.",
+        enriched: true,
+      });
+      expect(urls.some((url) => url.includes("featherless"))).toBe(true);
     });
   });
 

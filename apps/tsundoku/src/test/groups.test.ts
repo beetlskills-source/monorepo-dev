@@ -2,14 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   buildInvitePath,
   createGroup,
+  exitGroup,
   findGroupByInviteToken,
   isActiveMember,
   listActiveGroupIds,
   listCommonActiveGroupIds,
+  listGroupMembers,
   listGroupsForUser,
   listInvitationsForUser,
   recordInvitationFromToken,
   regenerateInviteToken,
+  removeGroupMember,
   respondToInvitation,
 } from "../lib/groups";
 
@@ -46,6 +49,14 @@ function createFakeDb(
         },
       };
       return statement;
+    },
+    /** Mirror D1's ordered batch: run each prepared statement in sequence. */
+    async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+      const results: unknown[] = [];
+      for (const statement of statements) {
+        results.push(await statement.run());
+      }
+      return results;
     },
   };
   return { db: db as unknown as D1Database, runs };
@@ -365,5 +376,134 @@ describe("respondToInvitation", () => {
     expect(runs.find((run) => run.sql.includes("UPDATE group_invitations"))?.args).toContain(
       "removed",
     );
+  });
+});
+
+describe("exitGroup", () => {
+  it("returns null and writes nothing when the caller is not an active member", async () => {
+    const { db, runs } = createFakeDb({ first: () => null });
+    await expect(
+      exitGroup(db, { groupId: "g-1", userId: "u-1" }),
+    ).resolves.toBeNull();
+    expect(runs).toHaveLength(0);
+  });
+
+  it("member: removes only the caller's own membership record", async () => {
+    const { db, runs } = createFakeDb({ first: () => ({ role: "member" }) });
+    await expect(
+      exitGroup(db, { groupId: "g-1", userId: "u-1" }),
+    ).resolves.toBe("left");
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.sql).toContain("DELETE FROM group_memberships");
+    expect(runs[0]?.args).toEqual(["g-1", "u-1"]);
+    // The group, its invitations, and every other member are untouched.
+    expect(runs.some((run) => run.sql.includes('DELETE FROM "groups"'))).toBe(false);
+    expect(runs.some((run) => run.sql.includes("group_invitations"))).toBe(false);
+  });
+
+  it("admin: cascades invitations, memberships, then the group row", async () => {
+    const { db, runs } = createFakeDb({ first: () => ({ role: "admin" }) });
+    await expect(
+      exitGroup(db, { groupId: "g-1", userId: "admin-1" }),
+    ).resolves.toBe("deleted");
+
+    expect(runs.map((run) => run.sql)).toEqual([
+      "DELETE FROM group_invitations WHERE group_id = ?",
+      "DELETE FROM group_memberships WHERE group_id = ?",
+      'DELETE FROM "groups" WHERE id = ?',
+    ]);
+    expect(runs.every((run) => run.args[0] === "g-1")).toBe(true);
+  });
+});
+
+describe("listGroupMembers", () => {
+  it("maps active members with resolved role and name/email", async () => {
+    const { db } = createFakeDb({
+      all: (sql) => {
+        expect(sql).toContain("m.status = 'active'");
+        return [
+          {
+            user_id: "admin-1",
+            role: "admin",
+            name: "Ada",
+            email: "ada@example.com",
+          },
+          {
+            user_id: "u-2",
+            role: "member",
+            name: null,
+            email: "bob@example.com",
+          },
+        ];
+      },
+    });
+
+    await expect(listGroupMembers(db, "g-1")).resolves.toEqual([
+      {
+        userId: "admin-1",
+        name: "Ada",
+        email: "ada@example.com",
+        role: "admin",
+        isAdmin: true,
+      },
+      {
+        userId: "u-2",
+        name: null,
+        email: "bob@example.com",
+        role: "member",
+        isAdmin: false,
+      },
+    ]);
+  });
+});
+
+describe("removeGroupMember", () => {
+  it("refuses a requester who is not the group's admin", async () => {
+    const { db, runs } = createFakeDb({ first: () => null });
+    await expect(
+      removeGroupMember(db, {
+        groupId: "g-1",
+        requesterId: "not-admin",
+        targetUserId: "u-2",
+      }),
+    ).resolves.toBe("not_admin");
+    expect(runs).toHaveLength(0);
+  });
+
+  it("never removes the admin row itself", async () => {
+    const { db, runs } = createFakeDb({
+      first: (sql) =>
+        sql.includes('FROM "groups"') ? { id: "g-1" } : { role: "admin" },
+    });
+    await expect(
+      removeGroupMember(db, {
+        groupId: "g-1",
+        requesterId: "admin-1",
+        targetUserId: "admin-1",
+      }),
+    ).resolves.toBe("not_member");
+    expect(runs).toHaveLength(0);
+  });
+
+  it("removes a non-admin member's active membership record", async () => {
+    const { db, runs } = createFakeDb({
+      first: (sql) =>
+        sql.includes('FROM "groups"') ? { id: "g-1" } : { role: "member" },
+    });
+    await expect(
+      removeGroupMember(db, {
+        groupId: "g-1",
+        requesterId: "admin-1",
+        targetUserId: "u-2",
+      }),
+    ).resolves.toBe("removed");
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.sql).toContain("DELETE FROM group_memberships");
+    expect(runs[0]?.args).toEqual(["g-1", "u-2"]);
+    // The group, its invitations, and other members are untouched.
+    expect(runs.some((run) => run.sql.includes('DELETE FROM "groups"'))).toBe(false);
+    expect(runs.some((run) => run.sql.includes("group_invitations"))).toBe(false);
   });
 });

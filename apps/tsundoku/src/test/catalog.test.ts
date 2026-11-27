@@ -178,3 +178,169 @@ describe("createCatalogClient", () => {
     await expect(client.lookupByIsbn(ISBN13)).resolves.toBeNull();
   });
 });
+
+describe("searchEditions", () => {
+  it("maps an Open Library search hit into candidate editions", async () => {
+    const { mock, urls } = mockFetch(() =>
+      json({
+        docs: [
+          {
+            title: "The C Programming Language",
+            author_name: ["Brian W. Kernighan", "Dennis M. Ritchie"],
+            publisher: ["Prentice Hall"],
+            first_publish_year: 1978,
+            isbn_13: [ISBN13],
+          },
+        ],
+      }),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+
+    await expect(
+      client.searchEditions({ title: "The C Programming Language" }),
+    ).resolves.toEqual([
+      {
+        title: "The C Programming Language",
+        authors: ["Brian W. Kernighan", "Dennis M. Ritchie"],
+        publisher: "Prentice Hall",
+        publishedYear: 1978,
+        isbn13: ISBN13,
+        isbn10: null,
+        source: "openlibrary",
+      },
+    ]);
+    expect(urls[0]).toContain("search.json");
+    expect(urls[0]).toContain("title=The+C+Programming+Language");
+    expect(urls.some((url) => url.includes("googleapis.com"))).toBe(false);
+  });
+
+  it("synthesizes an ISBN-13 when Open Library only lists an ISBN-10", async () => {
+    const { mock } = mockFetch(() =>
+      json({ docs: [{ title: "Old Edition", isbn_10: ["0306406152"] }] }),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(
+      client.searchEditions({ title: "Old Edition" }),
+    ).resolves.toMatchObject([{ isbn13: ISBN13, isbn10: "0306406152" }]);
+  });
+
+  it("passes the author to the Open Library search API", async () => {
+    const { mock, urls } = mockFetch(() => json({ docs: [] }));
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await client.searchEditions({ title: "Dune", author: "Frank Herbert" });
+
+    expect(urls[0]).toContain("author=Frank+Herbert");
+  });
+
+  it("falls back to Google Books when Open Library search has no docs", async () => {
+    const { mock, urls } = mockFetch((url) =>
+      url.includes("openlibrary.org")
+        ? json({ docs: [] })
+        : json({
+            totalItems: 1,
+            items: [
+              {
+                volumeInfo: {
+                  title: "Google Book",
+                  authors: ["Google Author"],
+                  publisher: "G Books",
+                  publishedDate: "2001-05-01",
+                  industryIdentifiers: [
+                    { type: "ISBN_13", identifier: ISBN13 },
+                  ],
+                },
+              },
+            ],
+          }),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+
+    await expect(client.searchEditions({ title: "Some Book" })).resolves.toEqual([
+      {
+        title: "Google Book",
+        authors: ["Google Author"],
+        publisher: "G Books",
+        publishedYear: 2001,
+        isbn13: ISBN13,
+        isbn10: null,
+        source: "google-books",
+      },
+    ]);
+    const googleUrl = urls.find((url) => url.includes("googleapis.com"));
+    expect(decodeURIComponent(googleUrl as string)).toContain("intitle:Some Book");
+    expect(googleUrl).toContain("maxResults=10");
+  });
+
+  it("retries Google Books with a plain query when the refined intitle: search misses", async () => {
+    const { mock, urls } = mockFetch((url) => {
+      if (url.includes("openlibrary.org")) return json({ docs: [] });
+      if (decodeURIComponent(url).includes("intitle:")) return json({ totalItems: 0 });
+      return json({
+        totalItems: 1,
+        items: [{ volumeInfo: { title: "Plain Hit", authors: [] } }],
+      });
+    });
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(
+      client.searchEditions({ title: "Hyphen-ated" }),
+    ).resolves.toMatchObject([{ title: "Plain Hit", source: "google-books" }]);
+    const googleCalls = urls.filter((url) => url.includes("googleapis.com"));
+    expect(googleCalls).toHaveLength(2);
+  });
+
+  it("includes the author in the refined Google Books query", async () => {
+    const { mock, urls } = mockFetch((url) =>
+      url.includes("openlibrary.org") ? json({ docs: [] }) : json({ totalItems: 0 }),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await client.searchEditions({ title: "Dune", author: "Frank Herbert" });
+
+    const googleUrl = urls.find((url) => url.includes("googleapis.com"));
+    expect(decodeURIComponent(googleUrl as string)).toContain(
+      "intitle:Dune inauthor:Frank Herbert",
+    );
+  });
+
+  it("returns an empty list when neither provider matches", async () => {
+    const { mock } = mockFetch((url) =>
+      url.includes("openlibrary.org") ? json({ docs: [] }) : json({ totalItems: 0 }),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(client.searchEditions({ title: "Nonexistent" })).resolves.toEqual([]);
+  });
+
+  it("treats a rate-limited (429) Google Books response as an empty result", async () => {
+    const { mock } = mockFetch((url) =>
+      url.includes("openlibrary.org") ? json({ docs: [] }) : json({}, 429),
+    );
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(client.searchEditions({ title: "Rate Limited" })).resolves.toEqual([]);
+  });
+
+  it("throws CatalogError when every provider errors", async () => {
+    const { mock } = mockFetch(() => {
+      throw new Error("network down");
+    });
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(
+      client.searchEditions({ title: "Anything" }),
+    ).rejects.toBeInstanceOf(CatalogError);
+  });
+
+  it("short-circuits a blank title without calling any provider", async () => {
+    const { mock, urls } = mockFetch(() => json({ docs: [] }));
+
+    const client = createCatalogClient({ fetchImpl: mock });
+    await expect(client.searchEditions({ title: "   " })).resolves.toEqual([]);
+    expect(urls).toHaveLength(0);
+  });
+});

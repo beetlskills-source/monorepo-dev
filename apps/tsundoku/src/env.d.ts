@@ -19,7 +19,14 @@ declare namespace Cloudflare {
     AUTH_EMAIL_FROM?: string;
 
     FEATHERLESS_API_KEY?: string;
+    /** Text model for LLM book-summary enrichment (Paid-Registered tier). */
     FEATHERLESS_MODEL?: string;
+    /**
+     * Multimodal model for the vision "Read Book Title" cover endpoint
+     * (`/api/books/extract-cover`, Paid-Registered tier). Defaults to
+     * `Qwen/Qwen2.5-VL-7B-Instruct` when unset.
+     */
+    FEATHERLESS_VISION_MODEL?: string;
     GOOGLE_BOOKS_API_KEY?: string;
 
     GITHUB_CLIENT_ID?: string;
@@ -51,6 +58,37 @@ declare namespace Cloudflare {
 
     RESEND_API_KEY?: string;
     TURNSTILE_SECRET_KEY?: string;
+
+    /**
+     * HitPay business API key, sent as `X-BUSINESS-API-KEY` when creating the
+     * one-time `$0.99` AI-unlock payment request. When unset, `/api/shelves/
+     * checkout` reports a config error instead of charging.
+     */
+    HITPAY_API_KEY?: string;
+    /** HitPay salt used to verify the `Hitpay-Signature` webhook HMAC. */
+    HITPAY_SALT?: string;
+    /**
+     * HitPay versioned API base URL — `https://api.sandbox.hit-pay.com/v1` in
+     * sandbox, `https://api.hit-pay.com/v1` in production.
+     */
+    HITPAY_API_URL?: string;
+    /**
+     * Optional currency override for the unlock charge. Defaults to
+     * `LLM_UNLOCK_CURRENCY` (USD) so pricing stays in one place.
+     */
+    HITPAY_CURRENCY?: string;
+
+    /**
+     * Per-action USD credit rates deducted from a user's balance when an AI
+     * feature runs. Each falls back to a documented default (`src/lib/credits.ts`)
+     * when unset or invalid, so an unconfigured deployment still meters.
+     *   - `CREDIT_RATE_BOOK_SUMMARY` (default `0.00001`) — per single book summary
+     *   - `CREDIT_RATE_BATCH_BOOK_SUMMARY` (default `0.00010`) — per book in a batch run
+     *   - `CREDIT_RATE_BOOK_TITLE_IMAGE` (default `0.00005`) — per cover/title image read
+     */
+    CREDIT_RATE_BOOK_SUMMARY?: string;
+    CREDIT_RATE_BATCH_BOOK_SUMMARY?: string;
+    CREDIT_RATE_BOOK_TITLE_IMAGE?: string;
 
     /**
      * Optional KV cache for shared-shelf reads on the dashboard. When bound,

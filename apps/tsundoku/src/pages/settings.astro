@@ -4,11 +4,41 @@ export const prerender = false;
 import { env } from "cloudflare:workers";
 import { getShelfConfig, type ShelfConfig } from "../lib/shelf-configs";
 import { getPickerPublicConfig, resolveSpreadsheetTitle } from "../lib/sheet-service";
+import {
+  formatCredit,
+  getCreditSummary,
+  resolveCreditRates,
+  type CreditSummary,
+} from "../lib/credits";
+import { LLM_UNLOCK_PRICE_USD } from "../lib/entitlements";
 
 const { user } = Astro.locals;
 if (!user) {
   return Astro.redirect("/login?next=%2Fsettings");
 }
+
+// Billing numbers are derived from the append-only credit ledger. Failure
+// isolation mirrors the shelf-config read: a schema drift or transient D1 error
+// must not take down the page, so fall back to zeroed defaults.
+const emptySummary: CreditSummary = {
+  balance: 0,
+  totalAdded: 0,
+  totalUsed: 0,
+  usageByAction: [],
+};
+let creditSummary: CreditSummary = emptySummary;
+try {
+  creditSummary = await getCreditSummary(env.DB, user.id);
+} catch (error) {
+  // Log rather than swallow: a schema drift (e.g. an unapplied migration) used
+  // to render as a legitimate "0 credit" reading, hiding the real failure.
+  console.warn(
+    "[settings] credit summary read failed:",
+    error instanceof Error ? error.message : error,
+  );
+  creditSummary = emptySummary;
+}
+const creditRates = resolveCreditRates(env);
 
 // Failure-isolated: a schema drift (e.g. an unapplied migration) or a transient
 // D1 error must never take down the page. Fall back to the "no sheet" defaults
@@ -16,7 +46,14 @@ if (!user) {
 let config: ShelfConfig | null = null;
 try {
   config = await getShelfConfig(env.DB, user.id);
-} catch {
+} catch (error) {
+  // Log rather than swallow: a schema drift (e.g. a migration that references a
+  // column the database does not yet have) used to render as a legitimate
+  // "not connected" state even when a valid token row existed.
+  console.warn(
+    "[settings] shelf config read failed:",
+    error instanceof Error ? error.message : error,
+  );
   config = null;
 }
 const connected = config?.hasRefreshToken ?? false;
@@ -65,6 +102,10 @@ const statusMessages: Record<string, { tone: string; text: string }> = {
     tone: "error",
     text: "We could not store the connection. Check the server's SHEET_TOKEN_ENCRYPTION_KEY.",
   },
+  storage_failed: {
+    tone: "error",
+    text: "We could not save the connection to the database. Please try again shortly.",
+  },
   config_error: {
     tone: "error",
     text: "Google Sheets is not fully configured on this deployment.",
@@ -86,10 +127,13 @@ const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
       class="app"
       data-picker-key={picker.apiKey ?? ""}
       data-picker-app-id={picker.appId ?? ""}
+      data-credit-added={String(creditSummary.totalAdded)}
+      data-credit-balance={String(creditSummary.balance)}
+      data-unlock-price={String(LLM_UNLOCK_PRICE_USD)}
     >
       <header class="header">
         <div>
-          <h1>Shelf settings</h1>
+          <h1>Account settings</h1>
           <p class="subtitle">Signed in as {user.email}</p>
         </div>
         <a class="button" href="/dashboard">Dashboard</a>
@@ -220,6 +264,78 @@ const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
         </form>
       </section>
 
+      <section class="panel" aria-label="Billing and metering">
+        <h2>Billing &amp; Metering</h2>
+        <p class="muted">
+          AI features run on prepaid credit. A $0.99 top-up adds credit; each AI
+          action deducts its rate. Every number below is summed from the credit
+          ledger, so it is auditable to the cent.
+        </p>
+
+        <dl class="billing">
+          <div>
+            <dt>Total credit added</dt>
+            <dd id="billing-added">${formatCredit(creditSummary.totalAdded)}</dd>
+          </div>
+          <div>
+            <dt>Credit remaining</dt>
+            <dd id="billing-balance">${formatCredit(creditSummary.balance)}</dd>
+          </div>
+          <div>
+            <dt>Total usage</dt>
+            <dd>${formatCredit(creditSummary.totalUsed)}</dd>
+          </div>
+        </dl>
+
+        <div class="controls">
+          <button type="button" id="top-up">
+            Top up AI credits — ${LLM_UNLOCK_PRICE_USD}
+          </button>
+        </div>
+        <p class="muted">
+          Repeatable at any balance: each top-up adds ${LLM_UNLOCK_PRICE_USD} of AI
+          credit, so you can top up again even with credit remaining.
+        </p>
+        <p id="billing-status" class="status" data-tone="info" role="status" hidden></p>
+
+        {
+          creditSummary.usageByAction.length > 0 && (
+            <div class="meter-list">
+              <h3>Usage by action</h3>
+              <ul>
+                {creditSummary.usageByAction.map((entry) => (
+                  <li>
+                    <span>{entry.label}</span>
+                    <span>${formatCredit(entry.total)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )
+        }
+
+        <div class="meter-list">
+          <h3>Current per-action rates</h3>
+          <ul>
+            <li>
+              <span>Book summary</span>
+              <span>${formatCredit(creditRates.bookSummary)}</span>
+              <code>CREDIT_RATE_BOOK_SUMMARY</code>
+            </li>
+            <li>
+              <span>Batch book summary</span>
+              <span>${formatCredit(creditRates.batchBookSummary)}</span>
+              <code>CREDIT_RATE_BATCH_BOOK_SUMMARY</code>
+            </li>
+            <li>
+              <span>Book title / cover image</span>
+              <span>${formatCredit(creditRates.bookTitleImage)}</span>
+              <code>CREDIT_RATE_BOOK_TITLE_IMAGE</code>
+            </li>
+          </ul>
+        </div>
+      </section>
+
       <p class="back"><a href="/">← Back to the scanner</a></p>
     </main>
 
@@ -318,7 +434,229 @@ const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
       const pickerApiKey = pageEl?.dataset.pickerKey ?? "";
       const pickerAppId = pageEl?.dataset.pickerAppId ?? "";
 
+      // --- Billing / top-up state (from the server-rendered attributes) -----
+      const topUpButton = document.getElementById("top-up") as HTMLButtonElement;
+      const billingStatusEl = document.getElementById(
+        "billing-status",
+      ) as HTMLParagraphElement;
+      const billingAddedEl = document.getElementById("billing-added") as HTMLElement;
+      const billingBalanceEl = document.getElementById("billing-balance") as HTMLElement;
+      const unlockPrice = pageEl?.dataset.unlockPrice ?? "0.99";
+      let creditBalance = Number(pageEl?.dataset.creditBalance ?? "0") || 0;
+      let creditAdded = Number(pageEl?.dataset.creditAdded ?? "0") || 0;
+
+      /** Query params HitPay appends to the return URL (mirrors the checkout route). */
+      const CHECKOUT_RETURN_PARAM = "unlock";
+      const CHECKOUT_RETURN_REFERENCE_PARAM = "ref";
+
       let pendingSpreadsheetId: string | null = null;
+
+      /** Format a USD amount with two decimals (e.g. `$0.99`). */
+      function formatCredit(value: number): string {
+        return `$${Math.max(0, value).toFixed(2)}`;
+      }
+
+      function setBillingStatus(message: string, tone: string): void {
+        billingStatusEl.hidden = false;
+        billingStatusEl.textContent = message;
+        billingStatusEl.dataset.tone = tone;
+      }
+
+      /** Re-render the top-up figures from the client-held ledger totals. */
+      function renderBilling(): void {
+        if (billingAddedEl) billingAddedEl.textContent = formatCredit(creditAdded);
+        if (billingBalanceEl) {
+          billingBalanceEl.textContent = formatCredit(creditBalance);
+        }
+      }
+
+      /**
+       * Start the repeatable $0.99 HitPay top-up and hand the browser to the
+       * hosted payment page. The return URL comes back to `/settings` so the
+       * reconcile flow below can credit and refresh the figures in place.
+       */
+      async function startTopUp(): Promise<void> {
+        topUpButton.disabled = true;
+        setBillingStatus("Starting secure checkout…", "info");
+        try {
+          const response = await fetch("/api/shelves/checkout", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ returnTo: "/settings" }),
+          });
+          const data = await readJson(response);
+          if (!response.ok || data?.ok !== true) {
+            setBillingStatus(
+              errorMessage(data, "Could not start checkout."),
+              "error",
+            );
+            topUpButton.disabled = false;
+            return;
+          }
+          const url = typeof data.url === "string" ? data.url : "";
+          if (!url) {
+            setBillingStatus(
+              "Could not start checkout. Please try again shortly.",
+              "error",
+            );
+            topUpButton.disabled = false;
+            return;
+          }
+          // Navigating to HitPay; leave the button disabled so a second click
+          // cannot open a duplicate charge.
+          window.location.href = url;
+        } catch {
+          setBillingStatus("Network error while starting checkout.", "error");
+          topUpButton.disabled = false;
+        }
+      }
+
+      /** The HitPay payment reference carried back in the return URL, if any. */
+      function getReturnReference(): string | null {
+        try {
+          const value = new URL(window.location.href).searchParams.get(
+            CHECKOUT_RETURN_REFERENCE_PARAM,
+          );
+          return value && value !== "" ? value : null;
+        } catch {
+          return null;
+        }
+      }
+
+      /** True when the page was reached by returning from the HitPay checkout. */
+      function isUnlockReturn(): boolean {
+        try {
+          return (
+            new URL(window.location.href).searchParams.get(CHECKOUT_RETURN_PARAM) ===
+            "return"
+          );
+        } catch {
+          return false;
+        }
+      }
+
+      /** Drop the checkout markers so a refresh does not re-poll. */
+      function clearUnlockReturnParams(): void {
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.delete(CHECKOUT_RETURN_PARAM);
+          url.searchParams.delete(CHECKOUT_RETURN_REFERENCE_PARAM);
+          window.history.replaceState(null, "", url.toString());
+        } catch {
+          // Non-fatal: leaving the marker only means one more poll on refresh.
+        }
+      }
+
+      /** Read the current credit balance from the entitlement endpoint. */
+      async function fetchCreditBalance(): Promise<number | null> {
+        try {
+          const response = await fetch("/api/shelves/entitlement");
+          const data = await readJson(response);
+          if (!response.ok) return null;
+          return typeof data?.creditBalance === "number" ? data.creditBalance : null;
+        } catch {
+          return null;
+        }
+      }
+
+      type TopUpOutcome =
+        | "completed"
+        | "pending"
+        | "failed"
+        | "unknown"
+        | "error";
+
+      /**
+       * Confirm a top-up via the server reconcile endpoint (which checks the
+       * payment's real status with HitPay) and refresh the billing figures.
+       * `credited` is false on an idempotent re-confirm, so the added total is
+       * only bumped when this call actually moved the balance.
+       */
+      async function confirmTopUp(reference: string): Promise<TopUpOutcome> {
+        try {
+          const response = await fetch("/api/shelves/reconcile-payment", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reference }),
+          });
+          const data = await readJson(response);
+          if (!response.ok || data?.ok !== true) return "error";
+          const status = typeof data.status === "string" ? data.status : "";
+          if (status === "completed") {
+            const amount =
+              typeof data.amount === "number"
+                ? data.amount
+                : Number(unlockPrice) || 0;
+            const balance =
+              typeof data.balance === "number" ? data.balance : creditBalance;
+            creditBalance = Math.max(0, balance);
+            if (data.credited === true) creditAdded += amount;
+            renderBilling();
+            setBillingStatus(
+              `Payment of ${formatCredit(amount)} is successful. Credit remaining: ${formatCredit(creditBalance)}.`,
+              "success",
+            );
+            return "completed";
+          }
+          if (status === "failed") {
+            setBillingStatus(
+              "Payment was not completed. You have not been charged.",
+              "error",
+            );
+            return "failed";
+          }
+          if (status === "pending") return "pending";
+          return "unknown";
+        } catch {
+          return "error";
+        } finally {
+          topUpButton.disabled = false;
+        }
+      }
+
+      /**
+       * After HitPay redirects back, confirm the payment and refresh the figures
+       * without a manual reload. Prefers the server reconcile (which checks
+       * HitPay directly) and falls back to polling the entitlement endpoint in
+       * case the webhook already credited the ledger.
+       */
+      async function pollForTopUp(attempts = 8, delayMs = 1500): Promise<void> {
+        const reference = getReturnReference();
+        let sawPending = false;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          if (reference) {
+            const outcome = await confirmTopUp(reference);
+            if (outcome === "completed" || outcome === "failed") {
+              clearUnlockReturnParams();
+              return;
+            }
+            if (outcome === "pending") {
+              sawPending = true;
+              setBillingStatus("Payment received — confirming with HitPay…", "info");
+            }
+          }
+          const balance = await fetchCreditBalance();
+          if (balance !== null && balance !== creditBalance) {
+            creditBalance = balance;
+            renderBilling();
+            clearUnlockReturnParams();
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, delayMs);
+          });
+        }
+        setBillingStatus(
+          sawPending
+            ? "Your payment is still pending confirmation with HitPay. Reopen this page in a moment to see the updated credit."
+            : "Still confirming your payment — reopen this page in a moment to see the updated credit.",
+          "warning",
+        );
+      }
+
+      topUpButton.addEventListener("click", () => {
+        void startTopUp();
+      });
 
       function setStatus(message: string, tone: string): void {
         statusEl.hidden = false;
@@ -757,6 +1095,15 @@ const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
           saveButton.disabled = false;
         }
       });
+
+      // Reflect the server-rendered ledger totals on first paint.
+      renderBilling();
+
+      // HitPay redirects the shopper back to `/settings?unlock=return&ref=…`;
+      // reconcile the payment and refresh the figures without a manual reload.
+      if (isUnlockReturn()) {
+        void pollForTopUp();
+      }
     </script>
 
     <style>
@@ -900,6 +1247,64 @@ const status = statusParam ? (statusMessages[statusParam] ?? null) : null;
       button:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+      }
+
+      h3 {
+        margin: 0;
+        font-size: 0.9rem;
+        opacity: 0.8;
+      }
+
+      .billing {
+        margin: 0;
+        display: grid;
+        gap: 0.5rem;
+      }
+
+      .billing > div {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      .billing dt {
+        opacity: 0.8;
+      }
+
+      .billing dd {
+        margin: 0;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .meter-list {
+        display: grid;
+        gap: 0.5rem;
+      }
+
+      .meter-list ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 0.35rem;
+      }
+
+      .meter-list li {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.75rem;
+        font-size: 0.9rem;
+      }
+
+      .meter-list li > span:last-of-type {
+        font-variant-numeric: tabular-nums;
+      }
+
+      .meter-list code {
+        font-size: 0.75rem;
+        opacity: 0.6;
       }
 
       .back {

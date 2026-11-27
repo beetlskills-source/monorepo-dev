@@ -82,6 +82,15 @@ export interface GoogleSheetsClient {
     range: string;
     values: string[][];
   }): Promise<void>;
+  /**
+   * Write many disjoint value ranges in a single `values:batchUpdate` call —
+   * e.g. backfilling one `summary` cell across many rows without N round trips.
+   */
+  batchUpdateValues(input: {
+    accessToken: string;
+    spreadsheetId: string;
+    data: Array<{ range: string; values: string[][] }>;
+  }): Promise<void>;
   /** Run batched structural edits (e.g. `deleteDimension` to remove a row). */
   batchUpdate(input: {
     accessToken: string;
@@ -364,6 +373,15 @@ export function createGoogleSheetsClient(
         method: "PUT",
         headers: authHeaders(accessToken),
         body: JSON.stringify({ values }),
+      });
+    },
+
+    async batchUpdateValues({ accessToken, spreadsheetId, data }) {
+      const url = `${GOOGLE_SHEETS_API}/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`;
+      await requestJson(url, {
+        method: "POST",
+        headers: authHeaders(accessToken),
+        body: JSON.stringify({ valueInputOption: "RAW", data }),
       });
     },
 

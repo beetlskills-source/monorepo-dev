@@ -6,6 +6,7 @@ import {
   createPkcePair,
   decodeOAuthStateCookie,
   encodeOAuthStateCookie,
+  EnrichSettingRequestSchema,
   sheetHeaderRange,
   sheetRange,
   SHEET_HEADER_ROW,
@@ -144,5 +145,22 @@ describe("ShelfSetupRequestSchema", () => {
     expect(
       ShelfSetupRequestSchema.safeParse({ action: "delete-everything" }).success,
     ).toBe(false);
+  });
+});
+
+describe("EnrichSettingRequestSchema", () => {
+  it("accepts a boolean preference and rejects anything else", () => {
+    expect(
+      EnrichSettingRequestSchema.safeParse({ enrichWithLlm: true }).success,
+    ).toBe(true);
+    expect(
+      EnrichSettingRequestSchema.safeParse({ enrichWithLlm: false }).success,
+    ).toBe(true);
+    // A string ("yes"/"no") or a missing field must be rejected so the route's
+    // stored integer can never drift from a real boolean.
+    expect(
+      EnrichSettingRequestSchema.safeParse({ enrichWithLlm: "yes" }).success,
+    ).toBe(false);
+    expect(EnrichSettingRequestSchema.safeParse({}).success).toBe(false);
   });
 });

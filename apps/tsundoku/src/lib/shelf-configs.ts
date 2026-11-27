@@ -27,6 +27,19 @@ export interface ShelfConfig {
   /** Whether the whole sheet appears to co-members' Shared Shelves (Level 2). */
   sheetVisibility: SheetVisibility;
   allowIncomingTransfers: boolean;
+  /**
+   * Whether an ISBN scan should also run the best-effort Featherless AI
+   * enrichment step ("Enrich book info with LLM" on the ISBN Scanner). Defaults
+   * to `false` (off), so an unset preference never waits on the LLM.
+   */
+  enrichWithLlm: boolean;
+  /**
+   * Whether the user has the one-time $0.99 "LLM unlock" entitlement, gating
+   * both AI features (LLM summaries and vision cover reading). Defaults to
+   * `false`, so every user starts on the free tier. Deliberately distinct from
+   * {@link enrichWithLlm}, which is only a preference.
+   */
+  hasLlmUnlock: boolean;
   /** True when an encrypted Google refresh token is stored. */
   hasRefreshToken: boolean;
   updatedAt: string;
@@ -39,6 +52,8 @@ export interface ShelfConfigPatch {
   defaultVisibility?: DefaultVisibility;
   sheetVisibility?: SheetVisibility;
   allowIncomingTransfers?: boolean;
+  enrichWithLlm?: boolean;
+  hasLlmUnlock?: boolean;
   /** Already-encrypted refresh token payload (see src/lib/crypto.ts). */
   googleRefreshTokenEncrypted?: string | null;
 }
@@ -50,12 +65,14 @@ interface ShelfConfigRow {
   default_visibility: string;
   sheet_visibility: string;
   allow_incoming_transfers: number;
+  enrich_with_llm: number;
+  has_llm_unlock: number;
   google_refresh_token_encrypted: string | null;
   updated_at: string;
 }
 
 const SELECT_COLUMNS =
-  "user_id, spreadsheet_id, sheet_tab_name, default_visibility, sheet_visibility, allow_incoming_transfers, google_refresh_token_encrypted, updated_at";
+  "user_id, spreadsheet_id, sheet_tab_name, default_visibility, sheet_visibility, allow_incoming_transfers, enrich_with_llm, has_llm_unlock, google_refresh_token_encrypted, updated_at";
 
 /** Maps a `ShelfConfigPatch` key to its column name. */
 const COLUMN_BY_KEY: Record<keyof ShelfConfigPatch, string> = {
@@ -64,6 +81,8 @@ const COLUMN_BY_KEY: Record<keyof ShelfConfigPatch, string> = {
   defaultVisibility: "default_visibility",
   sheetVisibility: "sheet_visibility",
   allowIncomingTransfers: "allow_incoming_transfers",
+  enrichWithLlm: "enrich_with_llm",
+  hasLlmUnlock: "has_llm_unlock",
   googleRefreshTokenEncrypted: "google_refresh_token_encrypted",
 };
 
@@ -80,6 +99,8 @@ function mapRow(row: ShelfConfigRow): ShelfConfig {
       row.default_visibility === "shared" ? "shared" : "private",
     sheetVisibility: row.sheet_visibility === "shared" ? "shared" : "private",
     allowIncomingTransfers: toBoolean(row.allow_incoming_transfers),
+    enrichWithLlm: toBoolean(row.enrich_with_llm),
+    hasLlmUnlock: toBoolean(row.has_llm_unlock),
     hasRefreshToken:
       typeof row.google_refresh_token_encrypted === "string" &&
       row.google_refresh_token_encrypted !== "",
@@ -327,8 +348,8 @@ export async function upsertShelfConfig(
 
   await db
     .prepare(
-      `INSERT OR IGNORE INTO shelf_configs (user_id, sheet_tab_name, default_visibility, sheet_visibility, allow_incoming_transfers, updated_at)
-       VALUES (?, ?, 'private', 'private', 0, ?)`,
+      `INSERT OR IGNORE INTO shelf_configs (user_id, sheet_tab_name, default_visibility, sheet_visibility, allow_incoming_transfers, enrich_with_llm, has_llm_unlock, updated_at)
+       VALUES (?, ?, 'private', 'private', 0, 0, 0, ?)`,
     )
     .bind(userId, DEFAULT_SHEET_TAB_NAME, now)
     .run();

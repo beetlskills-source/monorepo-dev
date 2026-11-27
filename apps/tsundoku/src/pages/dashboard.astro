@@ -9,11 +9,7 @@ import {
   listInvitationsForUser,
   recordInvitationFromToken,
 } from "../lib/groups";
-import {
-  loadOwnShelf,
-  loadSharedShelves,
-  type SharedShelfView,
-} from "../lib/shelves";
+import { loadOwnShelf, loadSharedShelves } from "../lib/shelves";
 import { listTransferTargets } from "../lib/shelf-configs";
 import { normalizeVisibility, parseGroupIds } from "../lib/shelf-rows";
 
@@ -79,6 +75,23 @@ const ignoredInvitations = invitations.filter(
 /** Resolve a row's comma-separated group ids to display names for the UI. */
 const groupNameById = new Map(groups.map((group) => [group.id, group.name]));
 
+/**
+ * Groups the user administers — the only ones with an invite link to hand out,
+ * backing the "Create groups and links" section.
+ */
+const adminGroups = groups.flatMap((group) =>
+  group.isAdmin && group.inviteToken
+    ? [
+        {
+          id: group.id,
+          name: group.name,
+          memberCount: group.memberCount,
+          inviteToken: group.inviteToken,
+        },
+      ]
+    : [],
+);
+
 const ownSpreadsheetUrl = ownShelf.spreadsheetId
   ? `https://docs.google.com/spreadsheets/d/${ownShelf.spreadsheetId}`
   : null;
@@ -108,14 +121,9 @@ const tabs: ShelfTab[] = [
   })),
 ];
 
-function sharedUrl(shelf: SharedShelfView): string {
-  return `https://docs.google.com/spreadsheets/d/${shelf.spreadsheetId}`;
-}
-
-function sharedLabel(shelf: SharedShelfView): string {
-  return `${shelf.title ?? shelf.spreadsheetId} (tab: ${shelf.sheetTabName})`;
-}
-
+// Shared shelves are read-only and never expose the owner's spreadsheet id,
+// tab name, or live title — a viewer sees the owner's identity and shared books
+// only, so another user's Google Sheet can never be located or opened.
 function addedDate(value: string): string {
   return value ? value.slice(0, 10) : "—";
 }
@@ -166,51 +174,37 @@ function inviteUrl(token: string): string {
           <p class="subtitle">Signed in as {user.email}</p>
         </div>
         <div class="controls">
-          <a class="button" href="/settings">Shelf settings</a>
+          <a class="button" href="/settings">Account settings</a>
           <a class="button" href="/">Scan a book</a>
           <button type="button" id="sign-out">Sign out</button>
         </div>
       </header>
 
-      <!-- Invitation inbox (Phase 5) -->
-      <section class="panel" id="invitations-panel" aria-label="Invitations">
+      <!-- Groups super section (Phase 5) -->
+      <section class="panel super-panel" id="groups-super" aria-label="Groups">
         <div class="shelf-head">
-          <h2>Invitations</h2>
-          <span id="invite-count" class="badge" data-count={pendingInvitations.length}>
-            {pendingInvitations.length} pending
-          </span>
+          <h2>Groups</h2>
         </div>
         <p class="muted">
-          Invitations to join a group. Accept to start sharing with its members,
-          or ignore to keep it out of the way.
+          Sharing and transfers are limited to the people in your groups.
         </p>
-        <p id="invitation-status" class="status" data-tone="error" role="status" hidden />
-        <ul id="invitation-list" class="invite-list">
-          {
-            pendingInvitations.map((invite) => (
-              <li class="invite-item" data-invitation-id={invite.id}>
-                <span>
-                  <strong>{invite.groupName}</strong>
-                  {" — invited by "}
-                  {invite.inviterEmail ?? "a group admin"}
-                </span>
-                <span class="controls">
-                  <button type="button" data-action="accept-invite">Accept</button>
-                  <button type="button" data-action="ignore-invite">Ignore</button>
-                  <button type="button" data-action="remove-invite">Remove</button>
-                </span>
-              </li>
-            ))
-          }
-        </ul>
-        <p id="invitation-empty" class="muted" hidden={pendingInvitations.length > 0}>
-          No pending invitations.
-        </p>
-        <details id="ignored-invitations" hidden={ignoredInvitations.length === 0}>
-          <summary>Ignored ({ignoredInvitations.length})</summary>
-          <ul class="invite-list">
+
+        <!-- Invitations to you -->
+        <section class="subpanel" id="invitations-panel" aria-label="Invitations to you">
+          <div class="shelf-head">
+            <h3>Invitations to you</h3>
+            <span id="invite-count" class="badge" data-count={pendingInvitations.length}>
+              {pendingInvitations.length} pending
+            </span>
+          </div>
+          <p class="muted">
+            Invitations to join a group. Accept to start sharing with its members,
+            or ignore to keep it out of the way.
+          </p>
+          <p id="invitation-status" class="status" data-tone="error" role="status" hidden />
+          <ul id="invitation-list" class="invite-list">
             {
-              ignoredInvitations.map((invite) => (
+              pendingInvitations.map((invite) => (
                 <li class="invite-item" data-invitation-id={invite.id}>
                   <span>
                     <strong>{invite.groupName}</strong>
@@ -219,47 +213,103 @@ function inviteUrl(token: string): string {
                   </span>
                   <span class="controls">
                     <button type="button" data-action="accept-invite">Accept</button>
+                    <button type="button" data-action="ignore-invite">Ignore</button>
                     <button type="button" data-action="remove-invite">Remove</button>
                   </span>
                 </li>
               ))
             }
           </ul>
-        </details>
-      </section>
+          <p id="invitation-empty" class="muted" hidden={pendingInvitations.length > 0}>
+            No pending invitations.
+          </p>
+          <details id="ignored-invitations" hidden={ignoredInvitations.length === 0}>
+            <summary>Ignored ({ignoredInvitations.length})</summary>
+            <ul class="invite-list">
+              {
+                ignoredInvitations.map((invite) => (
+                  <li class="invite-item" data-invitation-id={invite.id}>
+                    <span>
+                      <strong>{invite.groupName}</strong>
+                      {" — invited by "}
+                      {invite.inviterEmail ?? "a group admin"}
+                    </span>
+                    <span class="controls">
+                      <button type="button" data-action="accept-invite">Accept</button>
+                      <button type="button" data-action="remove-invite">Remove</button>
+                    </span>
+                  </li>
+                ))
+              }
+            </ul>
+          </details>
+        </section>
 
-      <!-- Groups (Phase 5) -->
-      <section class="panel" id="groups-panel" aria-label="Your groups">
-        <div class="shelf-head">
-          <h2>Your groups</h2>
-        </div>
-        <p class="muted">
-          Sharing and transfers are limited to people in your groups. Create a
-          group, then share its invite link.
-        </p>
-        <form id="create-group-form" autocomplete="off">
-          <label class="inline-label">
-            New group name
-            <input name="name" maxlength="80" placeholder="Book club" />
-          </label>
-          <button type="submit" id="create-group-button">Create group</button>
-        </form>
-        <p id="group-status" class="status" data-tone="error" role="status" hidden />
-        <p id="group-empty" class="muted" hidden={groups.length > 0}>
-          You are not in any group yet. Create one to start sharing.
-        </p>
-        <ul id="group-list" class="group-list">
-          {
-            groups.map((group) => (
-              <li class="group-item" data-group-id={group.id}>
-                <div class="group-head">
-                  <strong>{group.name}</strong>
-                  <span class="badge">{group.role}</span>
-                  <span class="muted">
-                    {group.memberCount} {group.memberCount === 1 ? "member" : "members"}
-                  </span>
-                </div>
-                {group.isAdmin && group.inviteToken ? (
+        <!-- Your current groups (role-aware memberships + exit) -->
+        <section class="subpanel" id="current-groups-panel" aria-label="Your current groups">
+          <div class="shelf-head">
+            <h3>Your current groups</h3>
+          </div>
+          <p class="muted">
+            The groups you belong to, with your role in each. Exiting as a group
+            admin deletes the group for everyone.
+          </p>
+          <p id="current-group-status" class="status" data-tone="error" role="status" hidden />
+          <p id="current-group-empty" class="muted" hidden={groups.length > 0}>
+            You are not in any group yet.
+          </p>
+          <ul id="current-group-list" class="group-list">
+            {
+              groups.map((group) => (
+                <li class="group-item" data-group-id={group.id} data-group-role={group.role}>
+                  <div class="group-head">
+                    <strong>{group.name}</strong>
+                    <span class="badge">{group.isAdmin ? "group admin" : "group member"}</span>
+                    <span class="muted" data-member-count>
+                      {group.memberCount} {group.memberCount === 1 ? "member" : "members"}
+                    </span>
+                  </div>
+                  <div class="controls">
+                    <button type="button" data-action="group-members">Members</button>
+                    <button type="button" data-action="exit-group">Exit group</button>
+                  </div>
+                </li>
+              ))
+            }
+          </ul>
+        </section>
+
+        <!-- Create groups and links (creation + invite-link management) -->
+        <section class="subpanel" id="groups-panel" aria-label="Create groups and links">
+          <div class="shelf-head">
+            <h3>Create groups and links</h3>
+          </div>
+          <p class="muted">
+            Create a group, then share its invite link with the readers you want
+            to share with.
+          </p>
+          <form id="create-group-form" autocomplete="off">
+            <label class="inline-label">
+              New group name
+              <input name="name" maxlength="80" placeholder="Book club" />
+            </label>
+            <button type="submit" id="create-group-button">Create group</button>
+          </form>
+          <p id="group-status" class="status" data-tone="error" role="status" hidden />
+          <p id="link-group-empty" class="muted" hidden={adminGroups.length > 0}>
+            You do not administer any group yet. Create one to hand out invites.
+          </p>
+          <ul id="group-list" class="group-list">
+            {
+              adminGroups.map((group) => (
+                <li class="group-item" data-group-id={group.id}>
+                  <div class="group-head">
+                    <strong>{group.name}</strong>
+                    <span class="badge">group admin</span>
+                    <span class="muted" data-member-count>
+                      {group.memberCount} {group.memberCount === 1 ? "member" : "members"}
+                    </span>
+                  </div>
                   <div class="invite-controls">
                     <input
                       type="text"
@@ -271,30 +321,24 @@ function inviteUrl(token: string): string {
                     <button type="button" data-action="copy-invite">Copy link</button>
                     <button type="button" data-action="rotate-invite">Regenerate</button>
                   </div>
-                ) : (
-                  <p class="muted">Only this group's admin can hand out invites.</p>
-                )}
-              </li>
-            ))
-          }
-        </ul>
+                </li>
+              ))
+            }
+          </ul>
+        </section>
       </section>
 
-      <!-- Shared-shelf group filter (Phase 5) -->
+      <!-- Show Shelves of Others: group filter (Phase 5) -->
       {
         groups.length > 0 && sharedShelves.length > 0 && (
-          <section class="panel" id="shared-filter" aria-label="Filter shared shelves">
+          <section class="panel" id="shared-filter" aria-label="Show shelves of others">
             <div class="shelf-head">
-              <h2>Shared shelves</h2>
+              <h2>Show Shelves of Others</h2>
               <button type="button" id="filter-clear" class="link">
                 Show all groups
               </button>
             </div>
-            <p class="muted">
-              Google sheets are shared within the groups you belong to. Actual
-              book visibility for sharing depends on the individual setting of
-              the book. Tick groups to filter what is shown.
-            </p>
+            <p class="muted">Tick groups to filter what is shown.</p>
             <div class="filter-options">
               {groups.map((group) => (
                 <label class="check">
@@ -356,17 +400,6 @@ function inviteUrl(token: string): string {
           }
         </div>
 
-        {
-          ownLabel && ownSpreadsheetUrl && (
-            <p class="muted">
-              Linked sheet:{" "}
-              <a href={ownSpreadsheetUrl} target="_blank" rel="noreferrer">
-                {ownLabel}
-              </a>
-            </p>
-          )
-        }
-
         <p id="own-status" class="status" data-tone="error" role="status" hidden />
 
         {
@@ -409,6 +442,14 @@ function inviteUrl(token: string): string {
               data-sheet-visibility-control
               data-visibility={ownShelf.sheetVisibility}
             >
+              {ownSpreadsheetUrl && (
+                <p class="muted">
+                  Linked Sheet:{" "}
+                  <a href={ownSpreadsheetUrl} target="_blank" rel="noopener noreferrer">
+                    {ownLabel ?? ownShelf.spreadsheetId}
+                  </a>
+                </p>
+              )}
               <div class="sheet-visibility-head">
                 <span class="muted">Sheet visibility</span>
                 <div class="segmented" role="group" aria-label="Sheet visibility">
@@ -438,6 +479,30 @@ function inviteUrl(token: string): string {
               </p>
               <p
                 id="sheet-visibility-status"
+                class="status"
+                data-tone="success"
+                role="status"
+                hidden
+              />
+            </div>
+          )
+        }
+
+        {
+          ownShelf.status !== "not_connected" && (
+            <div class="batch-action" data-batch-action>
+              <div class="batch-action-head">
+                <span class="muted">Batch action</span>
+                <button
+                  type="button"
+                  id="batch-enrich"
+                  disabled={!ownShelf.spreadsheetId}
+                >
+                  Enrich info of all books with LLM
+                </button>
+              </div>
+              <p
+                id="batch-enrich-status"
                 class="status"
                 data-tone="success"
                 role="status"
@@ -510,7 +575,6 @@ function inviteUrl(token: string): string {
       <!-- Shared Shelves (VIEWER, read-only) -->
       {
         sharedShelves.map((shelf) => {
-          const url = sharedUrl(shelf);
           const id = `shared:${shelf.ownerId}`;
           return (
             <section
@@ -525,12 +589,6 @@ function inviteUrl(token: string): string {
                 <h2>{shelf.ownerName || shelf.ownerEmail}</h2>
                 <span class="badge read-only">Read-only</span>
               </div>
-              <p class="muted">
-                Shared sheet:{" "}
-                <a href={url} target="_blank" rel="noreferrer">
-                  {sharedLabel(shelf)}
-                </a>
-              </p>
 
               {shelf.status === "error" ? (
                 <p class="status" data-tone="error" role="status">
@@ -551,6 +609,7 @@ function inviteUrl(token: string): string {
                         <th scope="col">Visibility</th>
                         <th scope="col">Groups</th>
                         <th scope="col">Added</th>
+                        <th scope="col"><span class="sr-only">Actions</span></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -558,6 +617,13 @@ function inviteUrl(token: string): string {
                         <tr
                           data-shared-row
                           data-groups={inheritedGroupIds(row.groups, shelf.groupIds).join(",")}
+                          data-shared-book={JSON.stringify({
+                            title: row.title,
+                            authors: row.authors,
+                            publisher: row.publisher,
+                            publishedYear: row.publishedYear,
+                            summary: row.summary,
+                          })}
                         >
                           <td>{row.title || "—"}</td>
                           <td>{row.authors || "—"}</td>
@@ -571,6 +637,9 @@ function inviteUrl(token: string): string {
                           </td>
                           <td class="muted">{inheritedGroupLabels(row.groups, shelf.groupIds)}</td>
                           <td class="muted">{addedDate(row.addedAt)}</td>
+                          <td class="row-actions">
+                            <button type="button" data-action="details">Details</button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -603,7 +672,7 @@ function inviteUrl(token: string): string {
             <option value="shared">shared</option>
           </select>
         </label>
-        <fieldset class="group-fieldset">
+        <fieldset class="group-fieldset" id="edit-groups-fieldset">
           <legend>Shared with groups</legend>
           {
             groups.length === 0 ? (
@@ -665,6 +734,73 @@ function inviteUrl(token: string): string {
         </dialog>
       )
     }
+
+    <dialog id="exit-group-dialog" aria-label="Exit group">
+      <form id="exit-group-form" method="dialog">
+        <h2 id="exit-group-title">Exit group</h2>
+        <p id="exit-group-message" class="muted" />
+        <p id="exit-group-warning" class="status" data-tone="error" role="alertdialog" hidden />
+        <input type="hidden" name="groupId" />
+        <p id="exit-group-status" class="status" data-tone="error" role="status" hidden />
+        <div class="controls">
+          <button type="submit" id="exit-group-save">Exit group</button>
+          <button type="button" id="exit-group-cancel">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="members-dialog" aria-label="Group members">
+      <div class="details">
+        <div class="shelf-head">
+          <h2 id="members-title">Members</h2>
+          <span class="badge read-only">Read-only roster</span>
+        </div>
+        <p id="members-status" class="status" data-tone="error" role="status" hidden />
+        <p id="members-empty" class="muted" hidden>No members to show.</p>
+        <ul id="members-list" class="group-list"></ul>
+        <div class="controls">
+          <button type="button" id="members-close">Close</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="remove-member-dialog" aria-label="Remove member">
+      <form id="remove-member-form" method="dialog">
+        <h2>Remove member</h2>
+        <input type="hidden" name="groupId" />
+        <input type="hidden" name="userId" />
+        <p id="remove-member-message" class="muted" />
+        <p id="remove-member-status" class="status" data-tone="error" role="status" hidden />
+        <div class="controls">
+          <button type="submit" id="remove-member-save">Remove member</button>
+          <button type="button" id="remove-member-cancel">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="details-dialog" aria-label="Book details">
+      <div class="details">
+        <div class="shelf-head">
+          <h2>Book details</h2>
+          <span class="badge read-only">Read-only</span>
+        </div>
+        <dl class="details-list">
+          <dt>Title</dt>
+          <dd data-detail="title">—</dd>
+          <dt>Authors</dt>
+          <dd data-detail="authors">—</dd>
+          <dt>Publisher</dt>
+          <dd data-detail="publisher">—</dd>
+          <dt>Published year</dt>
+          <dd data-detail="publishedYear">—</dd>
+          <dt>Summary</dt>
+          <dd data-detail="summary">—</dd>
+        </dl>
+        <div class="controls">
+          <button type="button" id="details-close">Close</button>
+        </div>
+      </div>
+    </dialog>
 
     <script>
       import { createAuthClient } from "better-auth/client";
@@ -728,6 +864,9 @@ function inviteUrl(token: string): string {
       const groupFilterInputs = Array.from(
         document.querySelectorAll<HTMLInputElement>('input[name="groupFilter"]'),
       );
+      const rowGroupFieldset = document.getElementById(
+        "edit-groups-fieldset",
+      ) as HTMLFieldSetElement | null;
 
       /** group id → display name, read from the rendered row-tagging controls. */
       const groupNameById = new Map(
@@ -787,6 +926,7 @@ function inviteUrl(token: string): string {
         for (const input of rowGroupInputs) {
           input.checked = selectedGroups.has(input.value);
         }
+        syncEditGroupControls();
         if (editStatus) editStatus.hidden = true;
         dialog.showModal();
       }
@@ -794,6 +934,19 @@ function inviteUrl(token: string): string {
       function readField(name: string): string {
         const element = field(name);
         return element ? element.value : "";
+      }
+
+      /**
+       * A private row is never shared, so its group targets are disabled (and
+       * greyed out) and left untouched on save — a private book can never leak
+       * to a group.
+       */
+      function syncEditGroupControls(): void {
+        const isPrivate = readField("visibility") !== "shared";
+        if (rowGroupFieldset) {
+          rowGroupFieldset.disabled = isPrivate;
+          rowGroupFieldset.dataset.disabled = String(isPrivate);
+        }
       }
 
       function applyRowUpdate(rowIndex: string, row: ShelfRowData): void {
@@ -831,6 +984,9 @@ function inviteUrl(token: string): string {
         if (saveButton) saveButton.disabled = true;
         if (editStatus) editStatus.hidden = true;
 
+        const visibility = readField("visibility") === "shared" ? "shared" : "private";
+        // A private row is never shared, so its group targets are omitted from
+        // the payload (left untouched on the sheet) rather than exposed.
         const body = {
           rowIndex,
           fields: {
@@ -839,11 +995,15 @@ function inviteUrl(token: string): string {
             publisher: readField("publisher"),
             publishedYear: readField("publishedYear"),
             summary: readField("summary"),
-            visibility: readField("visibility") === "shared" ? "shared" : "private",
-            groups: rowGroupInputs
-              .filter((input) => input.checked)
-              .map((input) => input.value)
-              .join(","),
+            visibility,
+            ...(visibility === "shared"
+              ? {
+                  groups: rowGroupInputs
+                    .filter((input) => input.checked)
+                    .map((input) => input.value)
+                    .join(","),
+                }
+              : {}),
           },
         };
 
@@ -980,6 +1140,88 @@ function inviteUrl(token: string): string {
         if (visibility) void setSheetVisibility(visibility);
       });
 
+      // --- Batch enrichment of every book --------------------------------
+      const batchEnrichButton = document.getElementById("batch-enrich") as HTMLButtonElement | null;
+      const batchEnrichStatus = document.getElementById("batch-enrich-status");
+
+      /** Merge refreshed summaries back into each row's stored data + cells. */
+      function applySummaryUpdates(
+        updates: Array<{ rowIndex: number; summary: string }>,
+      ): void {
+        for (const update of updates) {
+          const rowElement = document.querySelector<HTMLTableRowElement>(
+            `tr[data-row-index="${update.rowIndex}"]`,
+          );
+          if (!rowElement) continue;
+          let row: ShelfRowData;
+          try {
+            row = JSON.parse(rowElement.dataset.row ?? "{}") as ShelfRowData;
+          } catch {
+            continue;
+          }
+          row.summary = update.summary;
+          rowElement.dataset.row = JSON.stringify(row);
+          const cell = rowElement.querySelector<HTMLElement>('[data-cell="summary"]');
+          if (cell) cell.textContent = update.summary;
+        }
+      }
+
+      async function enrichAllBooks(): Promise<void> {
+        if (!batchEnrichButton) return;
+        const label = batchEnrichButton.textContent ?? "Enrich info of all books with LLM";
+        batchEnrichButton.disabled = true;
+        batchEnrichButton.textContent = "Enriching…";
+        showStatus(batchEnrichStatus, "Enriching…", "info");
+        try {
+          const response = await fetch("/api/shelves/batch-enrich", {
+            method: "POST",
+          });
+          const payload = (await response.json().catch(() => null)) as
+            | {
+                ok?: boolean;
+                message?: string;
+                enriched?: number;
+                skipped?: number;
+                total?: number;
+                updates?: Array<{ rowIndex: number; summary: string }>;
+              }
+            | null;
+          if (!response.ok || !payload?.ok) {
+            showStatus(
+              batchEnrichStatus,
+              payload?.message ?? "Could not enrich your shelf.",
+              "error",
+            );
+            return;
+          }
+          if (payload.updates && payload.updates.length > 0) {
+            applySummaryUpdates(payload.updates);
+          }
+          const enriched = payload.enriched ?? 0;
+          const skipped = payload.skipped ?? 0;
+          const total = payload.total ?? 0;
+          const message =
+            payload.message ??
+            (enriched === 0
+              ? `No books needed enriching (${skipped} already had a summary).`
+              : `Enriched ${enriched} of ${total} books (${skipped} skipped — already had a summary).`);
+          showStatus(batchEnrichStatus, message, enriched === 0 ? "info" : "success");
+        } catch {
+          showStatus(
+            batchEnrichStatus,
+            "Network error while enriching your shelf.",
+            "error",
+          );
+        } finally {
+          batchEnrichButton.textContent = label;
+          batchEnrichButton.disabled = false;
+        }
+      }
+
+      batchEnrichButton?.addEventListener("click", () => {
+        void enrichAllBooks();
+      });
+
       // --- Own shelf transfer --------------------------------------------
       const transferDialog = document.getElementById("transfer-dialog") as HTMLDialogElement | null;
       const transferForm = document.getElementById("transfer-form") as HTMLFormElement | null;
@@ -1058,13 +1300,53 @@ function inviteUrl(token: string): string {
         }
       }
 
+      // --- Shared-shelf read-only details --------------------------------
+      const detailsDialog = document.getElementById("details-dialog") as HTMLDialogElement | null;
+
+      /**
+       * Show the same book fields as the edit dialog for a book shared by
+       * another reader — strictly read-only, and with no visibility or
+       * group-sharing controls (a viewer cannot edit someone else's row).
+       */
+      function openDetails(rowElement: HTMLTableRowElement): void {
+        if (!detailsDialog) return;
+        let book: Partial<ShelfRowData>;
+        try {
+          book = JSON.parse(rowElement.dataset.sharedBook ?? "{}") as Partial<ShelfRowData>;
+        } catch {
+          return;
+        }
+        const set = (name: string, value: string): void => {
+          const element = detailsDialog.querySelector<HTMLElement>(
+            `[data-detail="${name}"]`,
+          );
+          if (element) element.textContent = value === "" ? "—" : value;
+        };
+        set("title", book.title ?? "");
+        set("authors", book.authors ?? "");
+        set("publisher", book.publisher ?? "");
+        set("publishedYear", book.publishedYear ?? "");
+        set("summary", book.summary ?? "");
+        detailsDialog.showModal();
+      }
+
+      document.getElementById("details-close")?.addEventListener("click", () => {
+        detailsDialog?.close();
+      });
+
       document.addEventListener("click", (event) => {
         const target = event.target as HTMLElement | null;
         const actionButton = target?.closest<HTMLButtonElement>("[data-action]");
         if (!actionButton) return;
+        const action = actionButton.dataset.action;
+        // Read-only details live on shared rows, which carry no edit state.
+        if (action === "details") {
+          const sharedRow = actionButton.closest<HTMLTableRowElement>("tr[data-shared-book]");
+          if (sharedRow) openDetails(sharedRow);
+          return;
+        }
         const rowElement = actionButton.closest<HTMLTableRowElement>("tr[data-row-index]");
         if (!rowElement) return;
-        const action = actionButton.dataset.action;
         if (action === "edit") openEdit(rowElement);
         else if (action === "transfer") openTransfer(rowElement);
         else if (action === "delete") void deleteRow(rowElement);
@@ -1200,6 +1482,283 @@ function inviteUrl(token: string): string {
         }
       }
 
+      // --- Exit group (role-aware) ---------------------------------------
+      const exitDialog = document.getElementById("exit-group-dialog") as HTMLDialogElement | null;
+      const exitForm = document.getElementById("exit-group-form") as HTMLFormElement | null;
+      const exitStatus = document.getElementById("exit-group-status");
+
+      /**
+       * Confirm an exit. A `group member` gets a light prompt; a `group admin`
+       * gets a prominent warning because confirming permanently deletes the
+       * group — its memberships, invitations, invite links, and all group
+       * sharing — for everyone.
+       */
+      function openExitGroup(groupElement: HTMLElement): void {
+        if (!exitDialog || !exitForm) return;
+        const groupId = groupElement.dataset.groupId ?? "";
+        if (!groupId) return;
+        const isAdmin = groupElement.dataset.groupRole === "admin";
+        const name =
+          groupElement.querySelector("strong")?.textContent?.trim() || "this group";
+
+        const title = document.getElementById("exit-group-title");
+        const message = document.getElementById("exit-group-message");
+        const warning = document.getElementById("exit-group-warning");
+        const saveButton = document.getElementById("exit-group-save");
+        if (isAdmin) {
+          if (title) title.textContent = "Delete group";
+          if (message) {
+            message.textContent = `You administer "${name}". Exiting deletes the group for everyone.`;
+          }
+          if (warning) {
+            warning.textContent =
+              `Exiting as group admin permanently deletes "${name}", all of its ` +
+              "memberships, every pending invitation and invite link, and all group " +
+              "sharing for everyone — as if the group never existed. This cannot be undone.";
+            warning.hidden = false;
+          }
+          if (saveButton) saveButton.textContent = "Delete group permanently";
+        } else {
+          if (title) title.textContent = "Exit group";
+          if (message) {
+            message.textContent = `Leave "${name}"? You will stop sharing books with its members.`;
+          }
+          if (warning) warning.hidden = true;
+          if (saveButton) saveButton.textContent = "Exit group";
+        }
+
+        const hidden = exitForm.querySelector<HTMLInputElement>('[name="groupId"]');
+        if (hidden) hidden.value = groupId;
+        if (exitStatus) exitStatus.hidden = true;
+        exitDialog.showModal();
+      }
+
+      /** Drop a group from the persisted "Show Shelves of Others" filter state. */
+      function forgetGroupFilter(groupId: string): void {
+        const unchecked = readUncheckedGroups();
+        if (!unchecked) return;
+        if (unchecked.delete(groupId)) writeUncheckedGroups(unchecked);
+      }
+
+      async function submitExitGroup(): Promise<void> {
+        if (!exitDialog || !exitForm) return;
+        const groupId =
+          exitForm.querySelector<HTMLInputElement>('[name="groupId"]')?.value ?? "";
+        if (!groupId) return;
+
+        const saveButton = document.getElementById("exit-group-save") as HTMLButtonElement | null;
+        if (saveButton) saveButton.disabled = true;
+        if (exitStatus) exitStatus.hidden = true;
+
+        try {
+          const response = await fetch("/api/groups/membership", {
+            method: "DELETE",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ groupId }),
+          });
+          const payload = (await response.json().catch(() => null)) as
+            | { ok?: boolean; outcome?: string; message?: string }
+            | null;
+          if (!response.ok || !payload?.ok) {
+            showStatus(exitStatus, payload?.message ?? "Could not exit the group.", "error");
+            if (saveButton) saveButton.disabled = false;
+            return;
+          }
+          // Clear any stale filter tick for the group, then re-render so "Your
+          // current groups", "Create groups and links", "Invitations to you",
+          // and "Show Shelves of Others" all reflect the change.
+          forgetGroupFilter(groupId);
+          window.location.reload();
+        } catch {
+          showStatus(exitStatus, "Network error while exiting the group.", "error");
+          if (saveButton) saveButton.disabled = false;
+        }
+      }
+
+      // --- Group membership roster (Members) ------------------------------
+      interface MemberView {
+        userId: string;
+        name: string | null;
+        email: string | null;
+        role: string;
+        isAdmin: boolean;
+      }
+
+      const membersDialog = document.getElementById(
+        "members-dialog",
+      ) as HTMLDialogElement | null;
+      const membersTitle = document.getElementById("members-title");
+      const membersList = document.getElementById("members-list");
+      const membersEmpty = document.getElementById("members-empty");
+      const membersStatus = document.getElementById("members-status");
+      const removeMemberDialog = document.getElementById(
+        "remove-member-dialog",
+      ) as HTMLDialogElement | null;
+      const removeMemberForm = document.getElementById(
+        "remove-member-form",
+      ) as HTMLFormElement | null;
+      const removeMemberStatus = document.getElementById("remove-member-status");
+      /** The group whose roster is currently open, for the remove action. */
+      let membersGroupId = "";
+
+      /** Open the read-only roster for one group, fetched on demand. */
+      async function openMembers(groupElement: HTMLElement): Promise<void> {
+        if (!membersDialog) return;
+        const groupId = groupElement.dataset.groupId ?? "";
+        if (!groupId) return;
+        membersGroupId = groupId;
+        const name =
+          groupElement.querySelector("strong")?.textContent?.trim() || "this group";
+        if (membersTitle) membersTitle.textContent = `Members of ${name}`;
+        if (membersList) membersList.replaceChildren();
+        if (membersEmpty) membersEmpty.hidden = true;
+        if (membersStatus) membersStatus.hidden = true;
+        membersDialog.showModal();
+
+        try {
+          const response = await fetch(
+            `/api/groups/members?groupId=${encodeURIComponent(groupId)}`,
+          );
+          const payload = (await response.json().catch(() => null)) as {
+            ok?: boolean;
+            viewerIsAdmin?: boolean;
+            members?: MemberView[];
+            message?: string;
+          } | null;
+          if (!response.ok || !payload?.ok || !payload.members) {
+            showStatus(membersStatus, payload?.message ?? "Could not load members.", "error");
+            return;
+          }
+          renderMembers(Boolean(payload.viewerIsAdmin), payload.members);
+        } catch {
+          showStatus(membersStatus, "Network error while loading members.", "error");
+        }
+      }
+
+      /** Render the roster: roles for everyone, "Remove member" for admins only. */
+      function renderMembers(viewerIsAdmin: boolean, members: MemberView[]): void {
+        if (!membersList) return;
+        membersList.replaceChildren();
+        if (members.length === 0) {
+          if (membersEmpty) membersEmpty.hidden = false;
+          return;
+        }
+        if (membersEmpty) membersEmpty.hidden = true;
+        for (const member of members) {
+          const item = document.createElement("li");
+          item.className = "group-item";
+          item.dataset.memberId = member.userId;
+
+          const head = document.createElement("div");
+          head.className = "group-head";
+          const name = document.createElement("strong");
+          name.textContent = member.name || member.email || "Member";
+          head.appendChild(name);
+          const role = document.createElement("span");
+          role.className = "badge";
+          role.textContent = member.isAdmin ? "group admin" : "group member";
+          head.appendChild(role);
+          item.appendChild(head);
+
+          if (member.name && member.email) {
+            const email = document.createElement("span");
+            email.className = "muted";
+            email.textContent = member.email;
+            item.appendChild(email);
+          }
+
+          // Only the group's admin can remove members, and never the admin row
+          // itself (that is handled by "Exit group", which deletes the group).
+          if (viewerIsAdmin && !member.isAdmin) {
+            const controls = document.createElement("div");
+            controls.className = "controls";
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.dataset.action = "remove-member";
+            remove.dataset.memberId = member.userId;
+            remove.dataset.memberLabel = member.name || member.email || "this member";
+            remove.textContent = "Remove member";
+            controls.appendChild(remove);
+            item.appendChild(controls);
+          }
+
+          membersList.appendChild(item);
+        }
+      }
+
+      /** Confirm, then remove one member (admin-only, enforced server-side). */
+      function openRemoveMember(button: HTMLButtonElement): void {
+        if (!removeMemberDialog || !removeMemberForm) return;
+        const userId = button.dataset.memberId ?? "";
+        if (!userId || !membersGroupId) return;
+        const label = button.dataset.memberLabel || "this member";
+        const groupIdInput = removeMemberForm.querySelector<HTMLInputElement>(
+          '[name="groupId"]',
+        );
+        const userInput = removeMemberForm.querySelector<HTMLInputElement>('[name="userId"]');
+        if (groupIdInput) groupIdInput.value = membersGroupId;
+        if (userInput) userInput.value = userId;
+        const message = document.getElementById("remove-member-message");
+        if (message) {
+          message.textContent =
+            `Remove ${label} from this group? They stop seeing this group's shared ` +
+            "books; their own personal books are not affected.";
+        }
+        if (removeMemberStatus) removeMemberStatus.hidden = true;
+        removeMemberDialog.showModal();
+      }
+
+      async function submitRemoveMember(): Promise<void> {
+        if (!removeMemberDialog || !removeMemberForm) return;
+        const groupId =
+          removeMemberForm.querySelector<HTMLInputElement>('[name="groupId"]')?.value ?? "";
+        const userId =
+          removeMemberForm.querySelector<HTMLInputElement>('[name="userId"]')?.value ?? "";
+        if (!groupId || !userId) return;
+
+        const saveButton = document.getElementById(
+          "remove-member-save",
+        ) as HTMLButtonElement | null;
+        if (saveButton) saveButton.disabled = true;
+        if (removeMemberStatus) removeMemberStatus.hidden = true;
+
+        try {
+          const response = await fetch("/api/groups/members", {
+            method: "DELETE",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ groupId, userId }),
+          });
+          const payload = (await response.json().catch(() => null)) as
+            | { ok?: boolean; message?: string }
+            | null;
+          if (!response.ok || !payload?.ok) {
+            showStatus(
+              removeMemberStatus,
+              payload?.message ?? "Could not remove the member.",
+              "error",
+            );
+            if (saveButton) saveButton.disabled = false;
+            return;
+          }
+          // Update the roster and the group's member counts in place.
+          membersList
+            ?.querySelector<HTMLElement>(`li[data-member-id="${userId}"]`)
+            ?.remove();
+          const remaining =
+            membersList?.querySelectorAll("li[data-member-id]").length ?? 0;
+          if (membersEmpty) membersEmpty.hidden = remaining > 0;
+          for (const counter of document.querySelectorAll<HTMLElement>(
+            `[data-group-id="${groupId}"] [data-member-count]`,
+          )) {
+            counter.textContent = `${remaining} ${remaining === 1 ? "member" : "members"}`;
+          }
+          removeMemberDialog.close();
+        } catch {
+          showStatus(removeMemberStatus, "Network error while removing the member.", "error");
+          if (saveButton) saveButton.disabled = false;
+        }
+      }
+
       document.addEventListener("click", (event) => {
         const target = event.target as HTMLElement | null;
         const actionButton = target?.closest<HTMLButtonElement>("[data-action]");
@@ -1220,6 +1779,12 @@ function inviteUrl(token: string): string {
         } else if (action === "rotate-invite") {
           const groupElement = actionButton.closest<HTMLElement>("[data-group-id]");
           if (groupElement) void rotateInvite(groupElement);
+        } else if (action === "group-members") {
+          const groupElement = actionButton.closest<HTMLElement>("[data-group-id]");
+          if (groupElement) void openMembers(groupElement);
+        } else if (action === "exit-group") {
+          const groupElement = actionButton.closest<HTMLElement>("[data-group-id]");
+          if (groupElement) openExitGroup(groupElement);
         } else if (
           action === "accept-invite" ||
           action === "ignore-invite" ||
@@ -1374,6 +1939,37 @@ function inviteUrl(token: string): string {
       document.getElementById("transfer-cancel")?.addEventListener("click", () => {
         transferDialog?.close();
       });
+
+      exitForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void submitExitGroup();
+      });
+
+      document.getElementById("exit-group-cancel")?.addEventListener("click", () => {
+        exitDialog?.close();
+      });
+
+      membersList?.addEventListener("click", (event) => {
+        const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>(
+          '[data-action="remove-member"]',
+        );
+        if (button) openRemoveMember(button);
+      });
+
+      document.getElementById("members-close")?.addEventListener("click", () => {
+        membersDialog?.close();
+      });
+
+      removeMemberForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void submitRemoveMember();
+      });
+
+      document.getElementById("remove-member-cancel")?.addEventListener("click", () => {
+        removeMemberDialog?.close();
+      });
+
+      field("visibility")?.addEventListener("change", syncEditGroupControls);
     </script>
 
     <style>
@@ -1416,6 +2012,11 @@ function inviteUrl(token: string): string {
       h2 {
         margin: 0;
         font-size: 1rem;
+      }
+
+      h3 {
+        margin: 0;
+        font-size: 0.95rem;
       }
 
       .subtitle,
@@ -1472,6 +2073,18 @@ function inviteUrl(token: string): string {
         gap: 0.75rem;
       }
 
+      .super-panel {
+        gap: 1rem;
+      }
+
+      .subpanel {
+        border: 1px solid #2a2f3a;
+        border-radius: 0.5rem;
+        padding: 0.85rem;
+        display: grid;
+        gap: 0.6rem;
+      }
+
       .shelf-head {
         display: flex;
         align-items: center;
@@ -1501,6 +2114,22 @@ function inviteUrl(token: string): string {
       }
 
       .sheet-visibility-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        flex-wrap: wrap;
+      }
+
+      .batch-action {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.6rem 0.75rem;
+        border: 1px solid #2a2f3a;
+        border-radius: 0.5rem;
+      }
+
+      .batch-action-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -1747,6 +2376,32 @@ function inviteUrl(token: string): string {
       .group-fieldset legend {
         font-size: 0.85rem;
         padding: 0 0.35rem;
+      }
+
+      /* A disabled fieldset (private visibility) greys out its group targets. */
+      .group-fieldset[disabled] {
+        opacity: 0.5;
+      }
+
+      .details {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .details-list {
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 0.35rem 1rem;
+        margin: 0;
+      }
+
+      .details-list dt {
+        font-size: 0.85rem;
+        opacity: 0.7;
+      }
+
+      .details-list dd {
+        margin: 0;
       }
 
       .check {

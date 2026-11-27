@@ -191,6 +191,28 @@ export function shelfRowRange(tabName: string, rowIndex: number): string {
   return sheetRange(tabName, `A${rowIndex}:${letter}${rowIndex}`);
 }
 
+/**
+ * 1-based column number of the `summary` cell, derived from the canonical
+ * header order (index 5 → column `F`).
+ */
+export const SHELF_SUMMARY_COLUMN_NUMBER = SHEET_HEADER_ROW.indexOf("summary") + 1;
+
+/**
+ * A1 range covering just the `summary` cell of one row (e.g. `'Books'!F2`), so
+ * a batch write backfills the summary without touching any sibling column.
+ */
+export function shelfSummaryRange(tabName: string, rowIndex: number): string {
+  return sheetRange(
+    tabName,
+    `${columnLetter(SHELF_SUMMARY_COLUMN_NUMBER)}${rowIndex}`,
+  );
+}
+
+/** True when a row's `summary` cell is blank (nothing to preserve or skip). */
+export function hasBlankSummary(row: ShelfRow): boolean {
+  return row.summary.trim() === "";
+}
+
 /** User-editable fields; everything else is preserved verbatim on save. */
 export const ShelfRowEditFieldsSchema = z.object({
   title: z.string().max(500).optional(),

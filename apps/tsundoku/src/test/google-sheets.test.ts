@@ -237,6 +237,35 @@ describe("createGoogleSheetsClient", () => {
     expect(calls[0]?.init?.method).toBe("PUT");
   });
 
+  it("backfills many ranges in one RAW values:batchUpdate call", async () => {
+    const { fetchImpl, calls } = createFetchStub(() => jsonResponse({}));
+    const client = createGoogleSheetsClient({
+      clientId: "cid",
+      clientSecret: "cs",
+      fetchImpl,
+    });
+
+    await client.batchUpdateValues({
+      accessToken: "access",
+      spreadsheetId: "sheet-1",
+      data: [
+        { range: "'Books'!F2", values: [["Summary two."]] },
+        { range: "'Books'!F5", values: [["Summary five."]] },
+      ],
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain("/spreadsheets/sheet-1/values:batchUpdate");
+    expect(calls[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]?.init?.body ?? "{}"))).toEqual({
+      valueInputOption: "RAW",
+      data: [
+        { range: "'Books'!F2", values: [["Summary two."]] },
+        { range: "'Books'!F5", values: [["Summary five."]] },
+      ],
+    });
+  });
+
   it("surfaces Google errors as GoogleSheetsError with status and code", async () => {
     const { fetchImpl } = createFetchStub(() =>
       jsonResponse({ error: { message: "The caller does not have permission", code: 403 } }, 403),

@@ -1,6 +1,6 @@
 import type { APIRoute } from "astro";
 import { env } from "cloudflare:workers";
-import { encryptSecret } from "../../../lib/crypto";
+import { EncryptionKeyError, encryptSecret } from "../../../lib/crypto";
 import {
   createGoogleSheetsClient,
   GoogleSheetsError,
@@ -88,13 +88,29 @@ export const GET: APIRoute = async (context) => {
     return redirectBack("no_refresh_token");
   }
 
+  // Separate the two failure modes so a D1/storage error is never reported to
+  // the user as a missing/incorrect SHEET_TOKEN_ENCRYPTION_KEY.
+  let encrypted: string;
   try {
-    const encrypted = await encryptSecret(refreshToken, encryptionKey);
+    encrypted = await encryptSecret(refreshToken, encryptionKey);
+  } catch (error) {
+    console.warn(
+      "[sheets-callback] failed to encrypt refresh token:",
+      error instanceof EncryptionKeyError ? error.message : "unexpected error",
+    );
+    return redirectBack("store_failed");
+  }
+
+  try {
     await upsertShelfConfig(env.DB, user.id, {
       googleRefreshTokenEncrypted: encrypted,
     });
-  } catch {
-    return redirectBack("store_failed");
+  } catch (error) {
+    console.warn(
+      "[sheets-callback] failed to persist shelf config:",
+      error instanceof Error ? error.message : "unexpected error",
+    );
+    return redirectBack("storage_failed");
   }
 
   return redirectBack("connected");

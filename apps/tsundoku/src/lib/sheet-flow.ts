@@ -6,7 +6,7 @@
  */
 
 import { z } from "zod";
-import type { BookLookupResult } from "@repo/book-schemas";
+import type { SaveableBook } from "@repo/book-schemas";
 import { toBase64Url, fromBase64Url } from "./crypto";
 import {
   DEFAULT_SHEET_TAB_NAME,
@@ -143,7 +143,7 @@ export function sheetHeaderRange(tabName: string): string {
 }
 
 export interface SheetRowInput {
-  book: BookLookupResult;
+  book: SaveableBook;
   visibility: DefaultVisibility;
   ownerEmail: string;
   addedAt: string;
@@ -151,10 +151,12 @@ export interface SheetRowInput {
 }
 
 /**
- * Flatten a normalized lookup result into a row matching {@link SHEET_HEADER_ROW}.
+ * Flatten a normalized book into a row matching {@link SHEET_HEADER_ROW}.
  * Nullable fields become empty strings so the sheet stays type-stable. The
  * `groups` column starts empty — a newly saved row belongs to no group until
- * the owner targets it from the dashboard.
+ * the owner targets it from the dashboard. Accepts the wider {@link SaveableBook}
+ * shape so an uncataloged "Read Book Title" entry (blank/synthetic ISBN, `source: "manual"`)
+ * writes through the same path as a catalog hit.
  */
 export function buildSheetRow(input: SheetRowInput): string[] {
   const { book } = input;
@@ -207,10 +209,22 @@ export const SheetVisibilityRequestSchema = z.object({
 export type SheetVisibilityRequest = z.infer<typeof SheetVisibilityRequestSchema>;
 
 /**
+ * Body for `POST /api/shelves/enrich-setting`. Persists the ISBN Scanner's
+ * "Enrich book info with LLM" preference (whether a scan also runs the
+ * best-effort Featherless enrichment step).
+ */
+export const EnrichSettingRequestSchema = z.object({
+  enrichWithLlm: z.boolean(),
+});
+
+export type EnrichSettingRequest = z.infer<typeof EnrichSettingRequestSchema>;
+
+/**
  * Body for `POST /api/sheets/save-book`. Validated in two steps (an envelope
- * first, then the book) because nesting `BookLookupResultSchema` directly
- * pushes Zod's type inference past its depth limit.
+ * first, then the book) because nesting the book schema directly pushes Zod's
+ * type inference past its depth limit. The book may be a catalog result or an
+ * uncataloged "Read Book Title" entry (see {@link SaveableBook}).
  */
 export interface SaveBookRequest {
-  book: BookLookupResult;
+  book: SaveableBook;
 }

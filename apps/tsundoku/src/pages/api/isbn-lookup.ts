@@ -8,7 +8,14 @@ import {
 } from "@repo/book-schemas";
 import { toIsbn13 } from "@repo/isbn";
 import { createCatalogClient } from "../../lib/catalog";
+import {
+  CREDIT_ACTION_BOOK_SUMMARY,
+  rateForAction,
+  recordUsage,
+  resolveCreditRates,
+} from "../../lib/credits";
 import { createFeatherlessClient } from "../../lib/featherless";
+import { readShelfEntitlement } from "../../lib/llm-entitlement";
 
 export const prerender = false;
 
@@ -23,10 +30,23 @@ export interface IsbnLookupDependencies {
   model?: string;
   /** Optional Google Books API key for the catalog fallback. */
   googleBooksApiKey?: string;
+  /**
+   * Whether the caller's saved "Enrich book info with LLM" preference allows
+   * enrichment. Defaults to `false` (off), matching the unset/default-`No`
+   * product default, so a lookup never waits on the LLM unless the user opted
+   * in. When `false`, only the fast catalog lookup runs.
+   */
+  enrich?: boolean;
   /** Injectable fetch implementation; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   temperature?: number;
+  /**
+   * Meter a successful summary against the user's credit balance. Invoked
+   * best-effort after enrichment produces a non-empty summary; a metering
+   * failure never fails the lookup.
+   */
+  chargeUsage?: (units: number) => Promise<unknown>;
 }
 
 function jsonResponse(body: unknown, status: number): Response {
@@ -42,6 +62,25 @@ function errorResponse(
   message: string,
 ): Response {
   return jsonResponse(ApiErrorResponseSchema.parse({ error, message }), status);
+}
+
+/**
+ * Run the metering callback without letting a metering failure break the
+ * lookup: the LLM work is already done, so the catalog result still returns.
+ */
+async function meterUsage(
+  charge: ((units: number) => Promise<unknown>) | undefined,
+  units = 1,
+): Promise<void> {
+  if (!charge) return;
+  try {
+    await charge(units);
+  } catch (error) {
+    console.warn(
+      "[credits] usage metering failed:",
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 
 /**
@@ -104,11 +143,13 @@ export async function handleIsbnLookup(
     );
   }
 
-  // Enrichment is best-effort and optional: without a key we skip the LLM
-  // entirely, and any failure degrades gracefully (`enriched: false`) without
-  // overriding the verified catalog identity.
+  // Enrichment is best-effort and opt-in: it runs only when the deployment has
+  // a key *and* the caller's saved "Enrich book info with LLM" preference is
+  // on. Without either, the fast catalog result is returned immediately, and any
+  // failure still degrades gracefully (`enriched: false`) without overriding
+  // the verified catalog identity.
   let summary: string | null = null;
-  if (dependencies.apiKey) {
+  if (dependencies.apiKey && (dependencies.enrich ?? false)) {
     try {
       const enrichment = createFeatherlessClient({
         apiKey: dependencies.apiKey,
@@ -122,6 +163,8 @@ export async function handleIsbnLookup(
         result.summary !== null && result.summary.trim() !== ""
           ? result.summary
           : null;
+      // Meter only when a summary was actually produced (best-effort).
+      if (summary !== null) await meterUsage(dependencies.chargeUsage, 1);
     } catch (error) {
       // Best-effort enrichment: keep the catalog result alive, but record the
       // reason server-side. Without this, a timed-out or failed enrichment is
@@ -152,9 +195,34 @@ export async function handleIsbnLookup(
 }
 
 /** Production route: wires the real Cloudflare `env` into the handler. */
-export const POST: APIRoute = (context) =>
-  handleIsbnLookup(context, {
+export const POST: APIRoute = async (context) => {
+  // Enrichment is a Paid-Registered-only AI feature. It runs only when the
+  // caller is signed in, holds the one-time $0.99 LLM unlock, *and* has the
+  // "Enrich book info with LLM" preference on. Anonymous visitors and every
+  // free tier fall through to the fast catalog-only lookup, so a free user can
+  // never reach Featherless.
+  let enrich = false;
+  const user = context.locals.user;
+  if (user) {
+    // Single-source entitlement read; fails closed to no enrichment so a free
+    // tier (or a D1 error) can never reach Featherless by accident.
+    const entitlement = await readShelfEntitlement(env.DB, user.id);
+    enrich = entitlement.enrichWithLlm && entitlement.hasLlmUnlock;
+  }
+
+  const rate = rateForAction(resolveCreditRates(env), CREDIT_ACTION_BOOK_SUMMARY);
+
+  return handleIsbnLookup(context, {
     apiKey: env.FEATHERLESS_API_KEY,
     model: env.FEATHERLESS_MODEL,
     googleBooksApiKey: env.GOOGLE_BOOKS_API_KEY,
+    enrich,
+    chargeUsage: user
+      ? (units) =>
+          recordUsage(env.DB, user.id, {
+            action: CREDIT_ACTION_BOOK_SUMMARY,
+            amount: rate * units,
+          })
+      : undefined,
   });
+};
